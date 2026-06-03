@@ -62,18 +62,6 @@ OPEN_REGISTRATION_RE = re.compile(
 )
 WHITESPACE_RE = re.compile(r"\s+")
 
-# IMPROVED: Better date range pattern
-TIMELINE_PATTERN = re.compile(
-    r"(\d{1,2})\s*[-–—]\s*(\d{1,2})\s+([a-zA-Z]+)\s*(\d{4})?",
-    re.IGNORECASE
-)
-
-# IMPROVED: Single date pattern with optional year
-SINGLE_DATE_PATTERN = re.compile(
-    r"(\d{1,2})\s+([a-zA-Z]+)\s+(\d{4})?",
-    re.IGNORECASE
-)
-
 # ---------------------------------------------------------------------------
 # Keyword sets
 # ---------------------------------------------------------------------------
@@ -87,69 +75,217 @@ FORM_HOSTS = {"forms.gle", "docs.google.com", "bit.ly", "s.id", "tinyurl.com", "
 DEDUP_STOPWORDS = {"the", "of", "and", "in", "on", "at", "to", "a", "an", "di", "ke", "se", "dan", "atau", "untuk", "dengan", "dalam", "dari", "oleh", "yang", "adalah", "ini", "itu"}
 SOURCE_PRIORITY = {"infolomba.id": 0, "silomba.id": 1}
 
-KATEGORI_KEYWORDS = {
+# ---------------------------------------------------------------------------
+# Kategori system (REFACTORED — word-boundary matching)
+# ---------------------------------------------------------------------------
+#
+# Setiap kategori punya:
+#   - "phrases": multi-word phrases (high confidence, +20 per match)
+#   - "words":   single words matched with \b boundary (+10 per match)
+#   - "exclude": jika kata ini muncul, skip kategori ini (anti false-positive)
+#   - "priority": tiebreaker (lower = lebih prioritas)
+#
+# PENTING: Semua matching pakai regex word-boundary (\b), bukan substring.
+# Ini mencegah "it" match di "submit", "ai" match di "sampai", dll.
+# ---------------------------------------------------------------------------
+
+KATEGORI_CONFIG = {
     "IT": {
-        "keywords": {"it", "programming", "coding", "developer", "web", "app", "software", "database", 
-                     "ai", "machine learning", "data science", "backend", "frontend", "fullstack",
-                     "python", "javascript", "java", "c++", "php", "golang", "rust", "cloud",
-                     "aws", "azure", "gcp", "devops", "cybersecurity", "hacking", "ctf",
-                     "pemrograman", "coding", "programmer", "kode", "sistem", "jaringan"},
-        "priority": 1
+        "phrases": {
+            "machine learning", "data science", "artificial intelligence",
+            "deep learning", "competitive programming", "web development",
+            "software engineering", "cyber security", "capture the flag",
+            "teknologi informasi", "ilmu komputer", "computer science",
+        },
+        "words": {
+            "programming", "coding", "developer", "software", "database",
+            "backend", "frontend", "fullstack", "python", "javascript",
+            "java", "golang", "rust", "devops", "cybersecurity",
+            "hacking", "ctf", "pemrograman", "programmer", "algorithm",
+            "algoritma", "hackathon",
+        },
+        "exclude": set(),
+        "priority": 1,
     },
     "Bisnis": {
-        "keywords": {"bisnis", "business", "entrepreneurship", "startup", "pitch", "investor",
-                     "kewirausahaan", "wirausaha", "marketing", "finance", "accounting", "sales",
-                     "business plan", "investor pitch", "venture", "unicorn", "career"},
-        "priority": 2
+        "phrases": {
+            "business plan", "business case", "investor pitch", "studi kasus",
+            "case study", "business model", "social entrepreneurship",
+            "kewirausahaan sosial", "business competition",
+        },
+        "words": {
+            "bisnis", "business", "entrepreneurship", "startup", "investor",
+            "kewirausahaan", "wirausaha", "marketing", "finance", "accounting",
+            "venture", "pitch",
+        },
+        "exclude": set(),
+        "priority": 3,
     },
     "Webdev": {
-        "keywords": {"webdev", "web development", "web design", "frontend", "backend", "fullstack",
-                     "responsive", "ui", "ux", "html", "css", "javascript", "react", "vue",
-                     "angular", "web development", "web designer", "web developer"},
-        "priority": 1
+        "phrases": {
+            "web development", "web design", "web developer", "web designer",
+            "web application", "front end", "back end", "full stack",
+            "ui/ux", "user interface", "user experience",
+        },
+        "words": {
+            "webdev", "html", "css", "react", "vue", "angular", "nextjs",
+            "laravel", "django", "flask", "wordpress",
+        },
+        "exclude": set(),
+        "priority": 2,
     },
     "Design": {
-        "keywords": {"design", "graphic design", "ui design", "ux design", "illustration", "motion",
-                     "visual", "branding", "logo", "desain", "grafis", "illustration",
-                     "figma", "photoshop", "adobe", "art", "creative"},
-        "priority": 3
+        "phrases": {
+            "graphic design", "ui design", "ux design", "desain grafis",
+            "desain komunikasi visual", "motion design", "brand identity",
+            "visual identity",
+        },
+        "words": {
+            "desain", "branding", "logo", "figma", "photoshop", "canva",
+            "illustrator", "corel", "typography", "tipografi",
+        },
+        "exclude": {"puisi", "cerpen", "novel", "sastra", "pantun"},
+        "priority": 4,
     },
     "Poster": {
-        "keywords": {"poster", "infografis", "infographic", "visual design", "graphic",
-                     "desain poster", "kreativitas visual"},
-        "priority": 3
+        "phrases": {
+            "desain poster", "lomba poster", "poster digital",
+            "poster competition", "kreativitas visual", "visual design",
+            "poster ilmiah", "poster scientific",
+        },
+        "words": {
+            "poster", "infografis", "infographic",
+        },
+        "exclude": set(),
+        "priority": 4,
     },
     "Data": {
-        "keywords": {"data", "data science", "data analytics", "machine learning", "ml",
-                     "big data", "analytics", "tableau", "power bi", "sql", "statistik",
-                     "data analyst", "data engineer"},
-        "priority": 2
+        "phrases": {
+            "data science", "data analytics", "data analysis", "big data",
+            "machine learning", "data mining", "data engineer", "data analyst",
+            "analisis data", "pengolahan data", "visualisasi data",
+            "data visualization",
+        },
+        "words": {
+            "tableau", "statistik", "statistics",
+        },
+        "exclude": {"data diri", "data peserta", "data pribadi", "isi data"},
+        "priority": 2,
     },
     "Mobile": {
-        "keywords": {"mobile", "app development", "android", "ios", "flutter", "react native",
-                     "aplikasi mobile", "smartphone", "iphone", "android app"},
-        "priority": 2
+        "phrases": {
+            "app development", "mobile app", "aplikasi mobile",
+            "android app", "ios app", "mobile development",
+            "react native", "flutter app",
+        },
+        "words": {
+            "android", "flutter", "kotlin", "swift",
+        },
+        "exclude": set(),
+        "priority": 2,
     },
     "Game": {
-        "keywords": {"game", "gaming", "game development", "unity", "unreal", "game design",
-                     "esports", "kompetisi game", "game dev"},
-        "priority": 2
+        "phrases": {
+            "game development", "game design", "game dev", "kompetisi game",
+            "game jam", "indie game",
+        },
+        "words": {
+            "gaming", "esports", "unity", "unreal", "godot",
+        },
+        "exclude": set(),
+        "priority": 3,
     },
     "Multimedia": {
-        "keywords": {"multimedia", "video", "editing", "audio", "animation", "motion graphic",
-                     "film", "cinematography", "produksi video", "premiere", "after effects"},
-        "priority": 3
+        "phrases": {
+            "motion graphic", "produksi video", "video editing",
+            "short film", "film pendek", "after effects",
+        },
+        "words": {
+            "multimedia", "cinematography", "sinematografi", "premiere",
+            "animasi", "animation",
+        },
+        "exclude": {"video profil", "video ucapan"},
+        "priority": 4,
     },
     "IoT": {
-        "keywords": {"iot", "internet of things", "embedded", "microcontroller", "arduino",
-                     "raspberry", "iot project", "sensor", "robotics"},
-        "priority": 2
+        "phrases": {
+            "internet of things", "iot project", "smart device",
+            "embedded system", "sistem embedded",
+        },
+        "words": {
+            "iot", "microcontroller", "arduino", "raspberry", "sensor",
+            "embedded",
+        },
+        "exclude": set(),
+        "priority": 2,
     },
     "Robotics": {
-        "keywords": {"robotics", "robot", "robotika", "automation", "mekatronika", "engineering"},
-        "priority": 2
+        "phrases": {
+            "lomba robot", "robot competition", "line follower",
+            "sumo robot",
+        },
+        "words": {
+            "robotics", "robot", "robotika", "mekatronika",
+        },
+        "exclude": set(),
+        "priority": 2,
+    },
+    "Karya Tulis": {
+        "phrases": {
+            "karya tulis", "karya tulis ilmiah", "lomba essay", "lomba esai",
+            "essay competition", "paper competition", "call for paper",
+            "scientific paper", "research paper", "literature review",
+            "lomba menulis", "writing competition", "lomba artikel",
+        },
+        "words": {
+            "essay", "esai", "makalah", "jurnal", "skripsi", "artikel",
+            "opini", "kolom",
+        },
+        "exclude": set(),
+        "priority": 2,
+    },
+    "Debat": {
+        "phrases": {
+            "lomba debat", "debate competition", "english debate",
+            "debat bahasa", "parliamentary debate", "asian parliamentary",
+        },
+        "words": {
+            "debat", "debate", "moot", "argumentasi",
+        },
+        "exclude": set(),
+        "priority": 2,
+    },
+    "Seni & Sastra": {
+        "phrases": {
+            "lomba puisi", "lomba cerpen", "baca puisi", "cipta puisi",
+            "lomba sastra", "lomba pantun", "lomba fotografi", "photo contest",
+            "lomba foto", "seni rupa", "seni tari", "seni musik",
+            "lomba menyanyi", "lomba band", "festival seni",
+        },
+        "words": {
+            "puisi", "cerpen", "sastra", "pantun", "novel",
+            "fotografi", "photography", "kaligrafi",
+            "tari", "musik", "menyanyi", "teater",
+        },
+        "exclude": set(),
+        "priority": 3,
     },
 }
+
+# Pre-compile regex patterns per kategori untuk performa
+_KATEGORI_COMPILED: dict[str, dict] = {}
+for _kat, _cfg in KATEGORI_CONFIG.items():
+    _compiled = {"priority": _cfg["priority"], "exclude": _cfg["exclude"]}
+
+    # Compile phrase patterns (match as substring, case-insensitive)
+    _compiled["phrase_patterns"] = [
+        re.compile(re.escape(p), re.IGNORECASE) for p in _cfg["phrases"]
+    ]
+    # Compile word patterns (match with word boundary)
+    _compiled["word_patterns"] = [
+        re.compile(r"\b" + re.escape(w) + r"\b", re.IGNORECASE) for w in _cfg["words"]
+    ]
+    _KATEGORI_COMPILED[_kat] = _compiled
 
 MONTH_MAP = {
     "januari": "Januari", "january": "Januari", "jan": "Januari",
@@ -164,6 +300,39 @@ MONTH_MAP = {
     "oktober": "Oktober", "october": "Oktober", "oct": "Oktober",
     "november": "November", "nov": "November",
     "desember": "Desember", "december": "Desember", "dec": "Desember",
+}
+
+# Build regex alternation from valid month names only
+_MONTH_NAMES_RE = "|".join(sorted(MONTH_MAP.keys(), key=len, reverse=True))
+
+# FIXED: Date range pattern — only matches valid month names, not arbitrary words
+TIMELINE_PATTERN = re.compile(
+    r"(\d{1,2})\s*[-–—]\s*(\d{1,2})\s+(" + _MONTH_NAMES_RE + r")\s*(\d{4})?",
+    re.IGNORECASE
+)
+
+# FIXED: Single date pattern — only matches valid month names
+SINGLE_DATE_PATTERN = re.compile(
+    r"(\d{1,2})\s+(" + _MONTH_NAMES_RE + r")(?:\s+(\d{4}))?",
+    re.IGNORECASE
+)
+
+# Pattern: "BulanNama dd, yyyy" atau "BulanNama dd yyyy" (English-style dates)
+ENGLISH_DATE_PATTERN = re.compile(
+    r"(" + _MONTH_NAMES_RE + r")\s+(\d{1,2})(?:\s*,\s*|\s+)(\d{4})",
+    re.IGNORECASE
+)
+
+# Pattern: "dd/mm/yyyy" atau "dd-mm-yyyy"
+NUMERIC_DATE_PATTERN = re.compile(
+    r"(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})"
+)
+
+# Month number to name mapping for numeric dates
+_MONTH_NUM_MAP = {
+    1: "Januari", 2: "Februari", 3: "Maret", 4: "April",
+    5: "Mei", 6: "Juni", 7: "Juli", 8: "Agustus",
+    9: "September", 10: "Oktober", 11: "November", 12: "Desember",
 }
 
 
@@ -207,7 +376,7 @@ def clean_title(text: str) -> str:
     text = strip_emoji_and_symbols(text)
     text = TITLE_PREFIX_RE.sub("", text)
     text = re.sub(r"https?://\S+", " ", text)
-    text = re.sub(r'[@#*_`>|"""\'\']+', " ", text)
+    text = re.sub(r"[@#*_`>|\"']+", " ", text)
     text = re.sub(r"\b(?:caption|repost|info lomba|infolomba)\b", " ", text, flags=re.I)
     text = re.sub(r"\s*[-–—|:]\s*(?:open registration|registration|pendaftaran).*$", "", text, flags=re.I)
     return normalize_space(text)[:140].strip(" -:|") or "Tanpa Judul"
@@ -249,108 +418,245 @@ def is_non_registration_context(text: str) -> bool:
 
 def _normalize_month(month_str: str) -> str:
     """Normalize bulan ke format Bulan penuh"""
-    return MONTH_MAP.get(month_str.lower().strip(), month_str)
+    return MONTH_MAP.get(month_str.lower().strip(), "")
+
+
+def _is_valid_month(month_str: str) -> bool:
+    """Check apakah string adalah nama bulan yang valid"""
+    return month_str.lower().strip() in MONTH_MAP
+
+
+def _is_valid_day(day: int) -> bool:
+    """Check apakah day masuk akal (1-31)"""
+    return 1 <= day <= 31
+
+
+def _extract_deadline_context(text: str) -> str:
+    """
+    Cari bagian text yang berisi konteks deadline/pendaftaran.
+    Prioritaskan kalimat yang mengandung keyword deadline.
+    """
+    deadline_keywords = {
+        "deadline", "batas", "pendaftaran", "registrasi", "registration",
+        "penutupan", "terakhir", "close", "closing", "due date", "submit",
+        "submission", "pengumpulan", "tenggat", "berakhir",
+    }
+    
+    lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+    deadline_lines = []
+    
+    for idx, line in enumerate(lines):
+        lower = line.lower()
+        if any(kw in lower for kw in deadline_keywords):
+            # Ambil baris ini + 2 baris setelahnya sebagai konteks
+            context = " ".join(lines[idx:min(len(lines), idx + 3)])
+            deadline_lines.append(context)
+    
+    return " ".join(deadline_lines) if deadline_lines else ""
 
 
 def extract_timeline(text: str) -> str:
     """
-    IMPROVED: Extract timeline dengan lebih akurat
-    Format output: "dd-dd BulanNama" atau "dd BulanNama" atau "dd BulanNama - dd BulanNama" atau ""
+    REFACTORED: Extract timeline/deadline dengan akurat.
+    
+    Strategi:
+    1. Cari konteks deadline dulu (baris dengan keyword "deadline", "pendaftaran", dll)
+    2. Dari konteks tersebut, extract tanggal
+    3. Jika tidak ada konteks deadline, fallback ke semua text
+    4. Hanya match nama bulan yang VALID (dari MONTH_MAP)
+    5. Validasi day range (1-31)
+    
+    Format output:
+    - "dd-dd Bulan yyyy" (range dalam 1 bulan)
+    - "dd Bulan - dd Bulan yyyy" (range antar bulan)
+    - "dd Bulan yyyy" (single date)
+    - "" (tidak ditemukan)
     """
     if not text:
         return ""
     
-    text_lower = text.lower()
+    # Coba cari dari konteks deadline dulu
+    deadline_ctx = _extract_deadline_context(text)
     
-    # Strategy 1: Cari date range dengan pattern "13 - 19 Mei 2026"
+    # Urutan pencarian: konteks deadline > full text
+    search_texts = [deadline_ctx, text] if deadline_ctx else [text]
+    
+    for search_text in search_texts:
+        result = _extract_dates_from_text(search_text)
+        if result:
+            return result
+    
+    return ""
+
+
+def _extract_dates_from_text(text: str) -> str:
+    """
+    Extract tanggal dari text. Hanya match bulan yang valid.
+    Returns formatted date string atau empty string.
+    """
+    if not text:
+        return ""
+    
+    # Strategy 1: Date range "13 - 19 Mei 2026" atau "13-19 Mei 2026"
     range_matches = []
     for match in TIMELINE_PATTERN.finditer(text):
-        day_start, day_end, month, year = match.groups()
-        try:
-            month_norm = _normalize_month(month)
-            year_str = year if year else "2026"  # Default ke 2026 jika tahun tidak ada
-            range_matches.append({
-                "type": "range",
-                "start_day": int(day_start),
-                "end_day": int(day_end),
-                "month": month_norm,
-                "year": year_str,
-                "start_pos": match.start()
-            })
-        except:
-            pass
+        day_start_s, day_end_s, month_s, year_s = match.groups()
+        month_norm = _normalize_month(month_s)
+        if not month_norm:  # Bulan tidak valid
+            continue
+        day_start, day_end = int(day_start_s), int(day_end_s)
+        if not (_is_valid_day(day_start) and _is_valid_day(day_end)):
+            continue
+        if day_end < day_start:  # End harus >= start dalam satu bulan
+            continue
+        year_str = year_s if year_s else "2026"
+        range_matches.append({
+            "start_day": day_start,
+            "end_day": day_end,
+            "month": month_norm,
+            "year": year_str,
+            "start_pos": match.start(),
+        })
     
     if range_matches:
         range_matches.sort(key=lambda x: x["start_pos"])
-        
-        # Jika hanya satu bulan, format: "dd-dd BulanNama TahunNama"
         first = range_matches[0]
         all_months = set(m["month"] for m in range_matches)
         
         if len(all_months) == 1:
             min_day = min(m["start_day"] for m in range_matches)
             max_day = max(m["end_day"] for m in range_matches)
-            year_str = first.get("year", "2026")
-            return f"{min_day}-{max_day} {first['month']} {year_str}".strip()
+            return f"{min_day}-{max_day} {first['month']} {first['year']}"
         else:
-            # Multiple months: "dd BulanNama - dd BulanNama TahunNama"
-            first_match = range_matches[0]
-            last_match = range_matches[-1]
-            year_str = last_match.get("year", "2026")
-            return f"{first_match['start_day']} {first_match['month']} - {last_match['end_day']} {last_match['month']} {year_str}".strip()
+            last = range_matches[-1]
+            return f"{first['start_day']} {first['month']} - {last['end_day']} {last['month']} {last['year']}"
     
-    # Strategy 2: Cari single dates "7 Juni 2026" atau "7 Juni"
+    # Strategy 2: English-style dates "June 15, 2026"
+    eng_matches = []
+    for match in ENGLISH_DATE_PATTERN.finditer(text):
+        month_s, day_s, year_s = match.groups()
+        month_norm = _normalize_month(month_s)
+        if not month_norm:
+            continue
+        day = int(day_s)
+        if not _is_valid_day(day):
+            continue
+        eng_matches.append({
+            "day": day,
+            "month": month_norm,
+            "year": year_s,
+            "start_pos": match.start(),
+        })
+    
+    if eng_matches:
+        eng_matches.sort(key=lambda x: x["start_pos"])
+        if len(eng_matches) >= 2:
+            first, last = eng_matches[0], eng_matches[-1]
+            if first["month"] == last["month"]:
+                return f"{first['day']}-{last['day']} {first['month']} {last['year']}"
+            return f"{first['day']} {first['month']} - {last['day']} {last['month']} {last['year']}"
+        m = eng_matches[0]
+        return f"{m['day']} {m['month']} {m['year']}"
+    
+    # Strategy 3: Single dates "7 Juni 2026" atau "7 Juni"
     single_matches = []
     for match in SINGLE_DATE_PATTERN.finditer(text):
-        day, month, year = match.groups()
-        try:
-            month_norm = _normalize_month(month)
-            year_str = year if year else "2026"
-            single_matches.append({
-                "day": int(day),
-                "month": month_norm,
-                "year": year_str,
-                "start_pos": match.start()
-            })
-        except:
-            pass
+        day_s, month_s, year_s = match.groups()
+        month_norm = _normalize_month(month_s)
+        if not month_norm:
+            continue
+        day = int(day_s)
+        if not _is_valid_day(day):
+            continue
+        year_str = year_s if year_s else "2026"
+        single_matches.append({
+            "day": day,
+            "month": month_norm,
+            "year": year_str,
+            "start_pos": match.start(),
+        })
     
     if single_matches:
         single_matches.sort(key=lambda x: x["start_pos"])
-        
-        # Jika ada 2+ single dates: "dd BulanNama - dd BulanNama TahunNama"
         if len(single_matches) >= 2:
-            first = single_matches[0]
-            last = single_matches[-1]
-            # Gunakan tahun dari last match atau first jika last tidak ada
-            year_str = last.get("year", first.get("year", "2026"))
-            return f"{first['day']} {first['month']} - {last['day']} {last['month']} {year_str}".strip()
-        else:
-            # Hanya 1 single date: "dd BulanNama TahunNama"
-            match = single_matches[0]
-            return f"{match['day']} {match['month']} {match['year']}".strip()
+            first, last = single_matches[0], single_matches[-1]
+            year_str = last["year"]
+            if first["month"] == last["month"]:
+                return f"{first['day']}-{last['day']} {first['month']} {year_str}"
+            return f"{first['day']} {first['month']} - {last['day']} {last['month']} {year_str}"
+        m = single_matches[0]
+        return f"{m['day']} {m['month']} {m['year']}"
+    
+    # Strategy 4: Numeric dates "15/06/2026" atau "15-06-2026"
+    num_matches = []
+    for match in NUMERIC_DATE_PATTERN.finditer(text):
+        d, m, y = int(match.group(1)), int(match.group(2)), match.group(3)
+        if 1 <= m <= 12 and _is_valid_day(d):
+            month_name = _MONTH_NUM_MAP.get(m, "")
+            if month_name:
+                num_matches.append({
+                    "day": d,
+                    "month": month_name,
+                    "year": y,
+                    "start_pos": match.start(),
+                })
+    
+    if num_matches:
+        num_matches.sort(key=lambda x: x["start_pos"])
+        if len(num_matches) >= 2:
+            first, last = num_matches[0], num_matches[-1]
+            if first["month"] == last["month"]:
+                return f"{first['day']}-{last['day']} {first['month']} {last['year']}"
+            return f"{first['day']} {first['month']} - {last['day']} {last['month']} {last['year']}"
+        m = num_matches[0]
+        return f"{m['day']} {m['month']} {m['year']}"
     
     return ""
 
 
 def extract_kategori(text: str, title: str = "") -> str:
     """
-    IMPROVED: Extract kategori dengan semantic understanding
+    REFACTORED: Extract kategori dengan word-boundary regex matching.
+
+    Perbaikan utama:
+    - TIDAK lagi pakai substring matching (yang menyebabkan "it" match di "submit").
+    - Multi-word phrases diberi skor lebih tinggi (+20) daripada single words (+10).
+    - Exclusion keywords: jika "puisi" muncul, kategori Design di-skip.
+    - Minimum score threshold: butuh minimal 10 point untuk masuk kategori.
     """
-    combined = f"{title} {text}".lower()
-    
-    scores = {}
-    for kategori, config in KATEGORI_KEYWORDS.items():
-        keyword_matches = sum(1 for kw in config["keywords"] if kw in combined)
-        if keyword_matches > 0:
-            # Score = (match_count * 10) - priority (lower priority = higher score)
-            scores[kategori] = (keyword_matches * 10, -config["priority"])
-    
+    combined = f"{title} {text}"
+    combined_lower = combined.lower()
+
+    scores: dict[str, int] = {}
+
+    for kategori, compiled in _KATEGORI_COMPILED.items():
+        # Check exclusion keywords dulu (substring ok untuk exclusion)
+        if compiled["exclude"] and any(ex in combined_lower for ex in compiled["exclude"]):
+            continue
+
+        score = 0
+
+        # Score phrases (+20 each — high confidence)
+        for pat in compiled["phrase_patterns"]:
+            if pat.search(combined):
+                score += 20
+
+        # Score words (+10 each — medium confidence, word-boundary)
+        for pat in compiled["word_patterns"]:
+            if pat.search(combined):
+                score += 10
+
+        if score > 0:
+            scores[kategori] = score
+
     if not scores:
         return "Lainnya"
-    
-    # Sort by match count descending, then by priority
-    best = sorted(scores.items(), key=lambda x: (x[1][0], x[1][1]), reverse=True)[0]
+
+    # Sort by score descending, then by priority ascending (lower = better)
+    best = max(
+        scores.items(),
+        key=lambda x: (x[1], -_KATEGORI_COMPILED[x[0]]["priority"]),
+    )
     return best[0]
 
 
@@ -579,25 +885,37 @@ def _call_openrouter(prompt: str) -> list:
         return []
 
 
+_VALID_KATEGORI = frozenset(KATEGORI_CONFIG.keys()) | {"Lainnya"}
+
 _LLM_PROMPT_PREFIX = (
     "Rapikan data lomba untuk mahasiswa. Untuk setiap item, kembalikan JSON array "
-    'dengan format {"id":"id","judul":"judul resmi","deadline":"timeline","kategori":"kategori","penyelenggara":"penyelenggara"}. '
+    '{"id":"id","judul":"judul resmi","deadline":"timeline","kategori":"kategori","penyelenggara":"penyelenggara"}. '
     "Field judul harus berupa nama lomba/program/event saja, tanpa emoji, sapaan, label "
     "pendaftaran, tanggal, atau URL. "
     "Field deadline adalah timeline gabungan dari tanggal awal sampai akhir "
     "(cth: '23-28 Januari 2026' atau '23 Januari - 28 Februari 2026'), kosongkan jika tidak ada. "
-    "Field kategori adalah kategori lomba "
-    "(IT/Bisnis/Webdev/Design/Poster/Data/Mobile/Game/Multimedia/IoT/Robotics/Lainnya). "
+    "Field kategori HARUS salah satu dari: "
+    "IT, Bisnis, Webdev, Design, Poster, Data, Mobile, Game, Multimedia, IoT, Robotics, "
+    "Karya Tulis, Debat, Seni & Sastra, Lainnya. "
     "Field penyelenggara adalah nama organisasi atau institusi penyelenggara (kosongkan jika tidak ada). "
     "Ekstrak dari caption yang diberikan. "
     "Jika tidak yakin, pertahankan data yang sudah ada atau isi dengan string kosong.\n\nData: "
 )
 
 
+def _item_needs_llm(item: dict) -> bool:
+    """Check apakah item butuh LLM processing (ada field kosong/lemah)."""
+    has_deadline = bool(item.get("deadline"))
+    has_kategori = item.get("kategori", "Lainnya") != "Lainnya"
+    has_penyelenggara = bool(item.get("penyelenggara"))
+    # Butuh LLM jika salah satu field masih kosong
+    return not (has_deadline and has_kategori and has_penyelenggara)
+
+
 def process_batch_with_openrouter(batch: list) -> list:
     """
-    Process batch items dengan OpenRouter DeepSeek
-    Ekstrak: deadline, kategori, penyelenggara dari caption
+    Process batch items dengan OpenRouter DeepSeek.
+    OPTIMIZED: Skip LLM call jika semua field sudah terisi.
     """
     if not batch:
         return batch
@@ -607,8 +925,16 @@ def process_batch_with_openrouter(batch: list) -> list:
         caption = item.get("caption", "")
         if not item.get("deadline"):
             item["deadline"] = extract_timeline(caption)
-        if not item.get("kategori"):
+        if not item.get("kategori") or item.get("kategori") == "Lainnya":
             item["kategori"] = extract_kategori(caption, item.get("judul", ""))
+
+    # Filter: hanya kirim item yang masih butuh LLM
+    needs_llm = [item for item in batch if _item_needs_llm(item)]
+    if not needs_llm:
+        print(f"[LLM] All {len(batch)} items already complete, skipping LLM call.")
+        return batch
+
+    print(f"[LLM] {len(needs_llm)}/{len(batch)} items need LLM processing.")
 
     payload = [
         {
@@ -618,7 +944,7 @@ def process_batch_with_openrouter(batch: list) -> list:
             "deadline": item.get("deadline", ""),
             "kategori": item.get("kategori", ""),
         }
-        for item in batch
+        for item in needs_llm
     ]
 
     llm_results = _call_openrouter(_LLM_PROMPT_PREFIX + json.dumps(payload, ensure_ascii=False))
@@ -631,21 +957,24 @@ def process_batch_with_openrouter(batch: list) -> list:
 
     for item in batch:
         row = llm_map.get(item["id"], {})
-        
+        if not row:
+            continue
+
         # Update judul jika LLM return yang lebih baik
         if row.get("judul"):
             title = clean_title(row["judul"])
             if title != "Tanpa Judul":
                 item["judul"] = title
-        
+
         # Update deadline
         if row.get("deadline"):
             item["deadline"] = row["deadline"]
-        
-        # Update kategori
-        if row.get("kategori") and row["kategori"] != "Lainnya":
-            item["kategori"] = row["kategori"]
-        
+
+        # Update kategori — VALIDATE terhadap daftar kategori yang valid
+        llm_kat = row.get("kategori", "")
+        if llm_kat and llm_kat in _VALID_KATEGORI and llm_kat != "Lainnya":
+            item["kategori"] = llm_kat
+
         # Update penyelenggara
         if row.get("penyelenggara"):
             item["penyelenggara"] = row["penyelenggara"]
