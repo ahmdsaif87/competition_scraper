@@ -3,16 +3,11 @@ name: Scraper Lomba Otomatis
 on:
   schedule:
     - cron: '0 17 * * *'   # 17:00 UTC = 00:00 WIB
-  workflow_dispatch:
-
-concurrency:
-  group: scraper
-  cancel-in-progress: false
+  workflow_dispatch:      
 
 jobs:
   scrape:
     runs-on: ubuntu-22.04
-    timeout-minutes: 15
 
     steps:
       - name: Checkout repo
@@ -21,23 +16,16 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.11'
           cache: 'pip'
 
       - name: Install Python dependencies
-        run: pip install -r requirements.txt
-
-      - name: Cache Playwright browsers
-        id: playwright-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+        run: |
+          pip install -r requirements.txt
 
       - name: Install Playwright browsers
-        if: steps.playwright-cache.outputs.cache-hit != 'true'
         run: playwright install chromium && playwright install-deps
-
+        
       - name: Run scraper to MongoDB
         env:
           IG_SESSION_ID: ${{ secrets.IG_SESSION_ID }}
