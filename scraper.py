@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import functools
 import hashlib
 import json
-import logging
 import os
 import random
 import re
@@ -18,14 +16,12 @@ import requests
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 from pymongo import UpdateOne
-
-logger = logging.getLogger(__name__)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +347,7 @@ def make_id(title: str, source: str) -> str:
 
 def is_mahasiswa(text: str) -> bool:
     lower = (text or "").lower()
-    return any(re.search(rf"\b{re.escape(kw)}\b", lower) for kw in MAHASISWA_KEYWORDS)
+    return any(kw in lower for kw in MAHASISWA_KEYWORDS)
 
 
 def normalize_space(text: str) -> str:
@@ -444,7 +440,6 @@ def _extract_deadline_context(text: str) -> str:
         "deadline", "batas", "pendaftaran", "registrasi", "registration",
         "penutupan", "terakhir", "close", "closing", "due date", "submit",
         "submission", "pengumpulan", "tenggat", "berakhir",
-        "paling lambat", "sampai dengan", "ditutup", "hingga", "s.d.",
     }
     
     lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
@@ -453,9 +448,8 @@ def _extract_deadline_context(text: str) -> str:
     for idx, line in enumerate(lines):
         lower = line.lower()
         if any(kw in lower for kw in deadline_keywords):
-            # Ambil 1 baris sebelumnya + baris ini + 2 baris setelahnya
-            start = max(0, idx - 1)
-            context = " ".join(lines[start:min(len(lines), idx + 3)])
+            # Ambil baris ini + 2 baris setelahnya sebagai konteks
+            context = " ".join(lines[idx:min(len(lines), idx + 3)])
             deadline_lines.append(context)
     
     return " ".join(deadline_lines) if deadline_lines else ""
@@ -844,113 +838,78 @@ def extract_registration_links(text: str = "", anchors: list[dict] | None = None
 # LLM (OpenRouter DeepSeek) helpers
 # ---------------------------------------------------------------------------
 
-_LLM_CACHE: dict[str, list] = {}
-_LLM_LAST_CALL = 0.0
-
 def _call_openrouter(prompt: str) -> list:
     """
-    Call OpenRouter API dengan retry & rate-limit handling.
+    Call OpenRouter API dengan DeepSeek v4 Flash (free tier)
     """
     if not OPENROUTER_API_KEY:
-        logger.warning("[LLM] OPENROUTER_API_KEY not set, skipping LLM processing")
+        print("[LLM] OPENROUTER_API_KEY not set, skipping LLM processing")
         return []
-
-    cache_key = hashlib.md5(prompt.encode()).hexdigest()
-    cached = _LLM_CACHE.get(cache_key)
-    if cached is not None:
-        logger.info("[LLM] Using cached result for this prompt.")
-        return cached
-
-    models = [
-        "deepseek/deepseek-v4-flash:free",
-        "google/gemini-2.0-flash-exp:free",
-        "mistralai/mistral-7b-instruct:free",
-    ]
-
-    for attempt in range(6):
-        global _LLM_LAST_CALL
-        since_last = time.time() - _LLM_LAST_CALL
-        if since_last < 2.0:
-            time.sleep(2.0 - since_last)
-
-        model = models[attempt % len(models)]
-        try:
-            response = requests.post(
-                url="https://openrouter.io/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                    "HTTP-Referer": "https://github.com",
-                    "X-Title": "Competition Scraper",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.3,
-                    "max_tokens": 2000,
-                },
-                timeout=90
-            )
-            _LLM_LAST_CALL = time.time()
-
-            if response.status_code == 200:
-                result = response.json()
-                content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-                data = safe_json_loads(content)
-                if isinstance(data, list):
-                    _LLM_CACHE[cache_key] = data
-                    return data
-                logger.warning("[LLM] Response not a list, retrying...")
-                continue
-
-            if response.status_code == 429:
-                retry_after = int(response.headers.get("Retry-After", 30))
-                logger.warning("[LLM] Rate limited (429) on %s, waiting %ds...", model, retry_after)
-                time.sleep(retry_after)
-                continue
-
-            if response.status_code >= 500:
-                logger.warning("[LLM] Server error %s on %s, retrying...", response.status_code, model)
-                time.sleep(5 * (attempt + 1))
-                continue
-
-            logger.error("[LLM] Error %s: %s", response.status_code, response.text)
+    
+    try:
+        response = requests.post(
+            url="https://openrouter.io/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "HTTP-Referer": "https://github.com",
+                "X-Title": "Competition Scraper",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "deepseek/deepseek-v4-flash:free",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                "temperature": 0.3,
+                "max_tokens": 2000,
+            },
+            timeout=60
+        )
+        
+        if response.status_code != 200:
+            print(f"[LLM] Error {response.status_code}: {response.text}")
             return []
-
-        except requests.ConnectionError:
-            logger.warning("[LLM] Connection error on %s, retrying...", model)
-            time.sleep(10)
-        except requests.Timeout:
-            logger.warning("[LLM] Timeout on %s, retrying...", model)
-            time.sleep(5)
-        except Exception as exc:
-            logger.exception("[LLM] Error: %s", exc)
-            return []
-
-    logger.error("[LLM] All retries exhausted.")
-    return []
+        
+        result = response.json()
+        content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+        
+        # Try to parse JSON from response
+        data = safe_json_loads(content)
+        return data if isinstance(data, list) else []
+        
+    except Exception as exc:
+        print(f"[LLM] Error: {exc}")
+        return []
 
 
 _VALID_KATEGORI = frozenset(KATEGORI_CONFIG.keys()) | {"Lainnya"}
 
 _LLM_PROMPT_PREFIX = (
-    "Rapikan data lomba. Kembalikan JSON array dengan field: id, judul, deadline, kategori, penyelenggara.\n"
-    "- judul: nama lomba, tanpa emoji/sapaan/URL/tanggal\n"
-    "- deadline: timeline (cth '23-28 Januari 2026'), kosongkan jika tidak ada\n"
-    "- kategori: salah satu dari IT, Bisnis, Webdev, Design, Poster, Data, Mobile, Game, Multimedia, IoT, Robotics, Karya Tulis, Debat, Seni & Sastra, Lainnya\n"
-    "- penyelenggara: nama institusi penyelenggara\n"
-    "Jika tidak yakin, pertahankan data yang sudah ada.\n\nData:\n"
+    "Rapikan data lomba untuk mahasiswa. Untuk setiap item, kembalikan JSON array "
+    '{"id":"id","judul":"judul resmi","deadline":"timeline","kategori":"kategori","penyelenggara":"penyelenggara"}. '
+    "Field judul harus berupa nama lomba/program/event saja, tanpa emoji, sapaan, label "
+    "pendaftaran, tanggal, atau URL. "
+    "Field deadline adalah timeline gabungan dari tanggal awal sampai akhir "
+    "(cth: '23-28 Januari 2026' atau '23 Januari - 28 Februari 2026'), kosongkan jika tidak ada. "
+    "Field kategori HARUS salah satu dari: "
+    "IT, Bisnis, Webdev, Design, Poster, Data, Mobile, Game, Multimedia, IoT, Robotics, "
+    "Karya Tulis, Debat, Seni & Sastra, Lainnya. "
+    "Field penyelenggara adalah nama organisasi atau institusi penyelenggara (kosongkan jika tidak ada). "
+    "Ekstrak dari caption yang diberikan. "
+    "Jika tidak yakin, pertahankan data yang sudah ada atau isi dengan string kosong.\n\nData: "
 )
 
 
 def _item_needs_llm(item: dict) -> bool:
     """Check apakah item butuh LLM processing (ada field kosong/lemah)."""
-    judul = item.get("judul", "")
-    has_judul = bool(judul) and judul not in ("Tanpa Judul", "") and len(judul) >= 5
     has_deadline = bool(item.get("deadline"))
     has_kategori = item.get("kategori", "Lainnya") != "Lainnya"
     has_penyelenggara = bool(item.get("penyelenggara"))
-    return not (has_judul and has_deadline and has_kategori and has_penyelenggara)
+    # Butuh LLM jika salah satu field masih kosong
+    return not (has_deadline and has_kategori and has_penyelenggara)
 
 
 def process_batch_with_openrouter(batch: list) -> list:
@@ -972,16 +931,16 @@ def process_batch_with_openrouter(batch: list) -> list:
     # Filter: hanya kirim item yang masih butuh LLM
     needs_llm = [item for item in batch if _item_needs_llm(item)]
     if not needs_llm:
-        logger.info("[LLM] All %d items already complete, skipping LLM call.", len(batch))
+        print(f"[LLM] All {len(batch)} items already complete, skipping LLM call.")
         return batch
 
-    logger.info("[LLM] %d/%d items need LLM processing.", len(needs_llm), len(batch))
+    print(f"[LLM] {len(needs_llm)}/{len(batch)} items need LLM processing.")
 
     payload = [
         {
             "id": item["id"],
             "judul": item.get("judul", ""),
-            "caption": item.get("caption", "")[:500],
+            "caption": item.get("caption", "")[:1000],
             "deadline": item.get("deadline", ""),
             "kategori": item.get("kategori", ""),
         }
@@ -1001,9 +960,8 @@ def process_batch_with_openrouter(batch: list) -> list:
         if not row:
             continue
 
-        # Update judul hanya jika judul hasil rule-based kosong/lemah
-        existing = item.get("judul", "")
-        if row.get("judul") and (existing in ("", "Tanpa Judul") or len(existing) < 5):
+        # Update judul jika LLM return yang lebih baik
+        if row.get("judul"):
             title = clean_title(row["judul"])
             if title != "Tanpa Judul":
                 item["judul"] = title
@@ -1048,63 +1006,17 @@ def _build_item(uid, source, title, poster, caption, links, direct_url) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Retry & HTTP helpers
-# ---------------------------------------------------------------------------
-
-def retry_with_backoff(max_attempts: int = 3, base_delay: float = 2.0):
-    def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            for attempt in range(max_attempts):
-                try:
-                    return func(*args, **kwargs)
-                except (requests.ConnectionError, requests.Timeout) as e:
-                    if attempt == max_attempts - 1:
-                        raise
-                    logger.warning("Retry %d/%d for %s: %s", attempt + 1, max_attempts, func.__name__, e)
-                    time.sleep(base_delay * (2 ** attempt))
-            return None
-        return wrapper
-    return decorator
-
-
-def _create_scraper() -> requests.Session:
-    try:
-        return cloudscraper.create_scraper()
-    except Exception as exc:
-        logger.warning("cloudscraper failed (%s), falling back to requests.Session", exc)
-        session = requests.Session()
-        session.headers.update(HEADERS)
-        return session
-
-
-# ---------------------------------------------------------------------------
 # Scraper: infolomba.id
 # ---------------------------------------------------------------------------
 
-def _fetch_page_with_retry(scraper, url: str, max_retries: int = 2) -> requests.Response | None:
-    for attempt in range(max_retries + 1):
-        try:
-            resp = scraper.get(url, headers=HEADERS, timeout=60)
-            if resp.status_code < 500:
-                return resp
-        except requests.RequestException as exc:
-            logger.warning("[infolomba] Attempt %d/%d failed: %s", attempt + 1, max_retries + 1, exc)
-            if attempt < max_retries:
-                time.sleep(5 * (attempt + 1))
-    return None
-
-
 def scrape_infolomba(seen_ids: set) -> list:
-    logger.info("[infolomba] Starting...")
+    print("[infolomba] Starting...")
     base_url = "https://infolomba.id"
-    scraper = _create_scraper()
+    scraper = cloudscraper.create_scraper()
     results = []
 
     try:
-        resp = _fetch_page_with_retry(scraper, base_url)
-        if resp is None:
-            return results
+        resp = scraper.get(base_url, headers=HEADERS, timeout=30)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -1114,36 +1026,10 @@ def scrape_infolomba(seen_ids: set) -> list:
             if urljoin(base_url, a.get("href", "")).startswith(base_url + "/")
         }
 
-        # Attempt pagination: follow "next page" or page-2 style links
-        pagination_links = set()
-        next_page = soup.find("a", string=re.compile(r"(next|selanjutnya|berikutnya|\d+)", re.I))
-        if not next_page:
-            next_page = soup.find("a", class_=re.compile(r"(next|pagination|page)", re.I))
-        if next_page and (href := next_page.get("href")):
-            pagination_links.add(urljoin(base_url, href))
-
-        for page_url in pagination_links:
-            try:
-                presp = scraper.get(page_url, headers=HEADERS, timeout=30)
-                if presp.status_code == 200:
-                    psoup = BeautifulSoup(presp.text, "html.parser")
-                    for a in psoup.find_all("a", href=lambda h: h and "info-" in h):
-                        href = urljoin(base_url, a["href"])
-                        if href.startswith(base_url + "/") and href not in unique_links:
-                            unique_links[href] = a
-            except requests.RequestException:
-                pass
-
-        logger.info("[infolomba] Found %d links (incl. pagination)", len(unique_links))
-
-        @retry_with_backoff(max_attempts=2)
-        def _fetch_page(url: str) -> requests.Response | None:
-            return scraper.get(url, headers=HEADERS, timeout=30)
-
         for link, anchor in list(unique_links.items())[:MAX_WEB_ITEMS]:
             try:
-                res = _fetch_page(link)
-                if res is None or res.status_code != 200:
+                res = scraper.get(link, headers=HEADERS, timeout=30)
+                if res.status_code != 200:
                     continue
 
                 dsoup = BeautifulSoup(res.text, "html.parser")
@@ -1179,17 +1065,13 @@ def scrape_infolomba(seen_ids: set) -> list:
                 ))
                 seen_ids.add(uid)
 
-            except requests.RequestException as exc:
-                logger.warning("[infolomba] Skip %s: %s", link, exc)
             except Exception as exc:
-                logger.exception("[infolomba] Skip %s: %s", link, exc)
+                print(f"[infolomba] Skip {link}: {exc}")
 
-    except requests.RequestException as exc:
-        logger.error("[infolomba] Error: %s", exc)
     except Exception as exc:
-        logger.exception("[infolomba] Error: %s", exc)
+        print(f"[infolomba] Error: {exc}")
 
-    logger.info("[infolomba] Done: %d items", len(results))
+    print(f"[infolomba] Done: {len(results)} items")
     return results
 
 
@@ -1198,15 +1080,15 @@ def scrape_infolomba(seen_ids: set) -> list:
 # ---------------------------------------------------------------------------
 
 async def scrape_silomba(seen_ids: set) -> list:
-    logger.info("[silomba] Starting...")
+    print("[silomba] Starting...")
     base_url = "https://silomba.id"
     results = []
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, timeout=30000)
+        browser = await p.chromium.launch(headless=True)
         try:
             page = await browser.new_page(user_agent=HEADERS["User-Agent"])
-            await page.goto(base_url, wait_until="load", timeout=60000)
+            await page.goto(base_url, wait_until="networkidle", timeout=45000)
             await page.wait_for_selector("#competition-section", timeout=15000)
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(2000)
@@ -1253,17 +1135,17 @@ async def scrape_silomba(seen_ids: set) -> list:
                     links = extract_registration_links(full_text, anchor_rows(dsoup, base_url))
 
                 except Exception as exc:
-                    logger.exception("[silomba] Detail failed %s: %s", link_detail, exc)
+                    print(f"[silomba] Detail failed {link_detail}: {exc}")
 
                 results.append(_build_item(uid, "silomba.id", title, poster, caption, links, link_detail))
                 seen_ids.add(uid)
 
         except Exception as exc:
-            logger.exception("[silomba] Error: %s", exc)
+            print(f"[silomba] Error: {exc}")
         finally:
             await browser.close()
 
-    logger.info("[silomba] Done: %d items", len(results))
+    print(f"[silomba] Done: {len(results)} items")
     return results
 
 
@@ -1272,11 +1154,8 @@ async def scrape_silomba(seen_ids: set) -> list:
 # ---------------------------------------------------------------------------
 
 def _normalize_ig_caption(raw: str) -> str:
-    caption = (raw or "").strip()
-    caption = re.sub(r"^\s*[^:\n]{1,80}\s+on Instagram:\s*", "", caption, flags=re.I)
-    caption = re.sub(r"^\s*@?\w+\s*(•|on Instagram)?\s*", "", caption, flags=re.I)
-    caption = re.sub(r'^\s*"|\"\s*$', "", caption)
-    return caption.strip()
+    caption = re.sub(r"^\s*[^:\n]{1,80}\s+on Instagram:\s*", "", (raw or "").strip(), flags=re.I)
+    return re.sub(r'^\s*"|\"\s*$', "", caption).strip()
 
 
 def _ig_shortcode(url: str) -> str:
@@ -1284,7 +1163,18 @@ def _ig_shortcode(url: str) -> str:
     return match.group(1) if match else url
 
 
-_IG_POSTER_JS = """() => {
+def _build_chrome_driver() -> webdriver.Chrome:
+    opts = Options()
+    for arg in ("--headless=new", "--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage",
+                 f"user-agent={HEADERS['User-Agent']}"):
+        opts.add_argument(arg)
+    if os.path.exists("/opt/chrome/chrome"):
+        opts.binary_location = "/opt/chrome/chrome"
+    service = Service("/usr/bin/chromedriver") if os.path.exists("/usr/bin/chromedriver") else Service()
+    return webdriver.Chrome(service=service, options=opts)
+
+
+_IG_POSTER_JS = """
 const imgs = Array.from(document.querySelectorAll('article img'));
 for (const img of imgs) {
   const src = img.currentSrc || img.src || '';
@@ -1293,140 +1183,107 @@ for (const img of imgs) {
   if (src.includes('scontent') || src.includes('cdninstagram')) return src;
 }
 return '';
-}"""
+"""
 
 
-async def _collect_post_urls(page, account: str) -> list[str]:
-    await page.goto(f"https://www.instagram.com/{account}/", wait_until="networkidle")
-    await page.wait_for_timeout(random.randint(4000, 6000))
-
-    if "page not found" in (await page.title()).lower():
+def _collect_post_urls(driver, account: str) -> list[str]:
+    driver.get(f"https://www.instagram.com/{account}/")
+    time.sleep(random.randint(4, 6))
+    if "page not found" in driver.title.lower():
         return []
 
     seen, urls = set(), []
-    last_height = await page.evaluate("document.body.scrollHeight")
+    last_height = driver.execute_script("return document.body.scrollHeight")
     for _ in range(3):
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await page.wait_for_timeout(random.randint(2000, 4000))
-
-        hrefs = await page.evaluate("""() =>
-            Array.from(document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"]'))
-                .map(el => el.href)
-        """)
-        for href in hrefs:
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(random.randint(2, 4))
+        for el in driver.find_elements(By.XPATH, '//a[contains(@href,"/p/") or contains(@href,"/reel/")]'):
+            href = el.get_attribute("href")
             if href and href not in seen:
                 seen.add(href)
                 urls.append(href)
-
-        new_height = await page.evaluate("document.body.scrollHeight")
+        new_height = driver.execute_script("return document.body.scrollHeight")
         if new_height == last_height:
             break
         last_height = new_height
     return urls
 
 
-async def _scrape_ig_post(browser, url: str, account: str, seen_ids: set) -> dict | None:
-    page = await browser.new_page(user_agent=HEADERS["User-Agent"])
+def _scrape_ig_post(driver, url: str, account: str, seen_ids: set) -> dict | None:
+    driver.get(url)
     try:
-        await page.goto(url, wait_until="networkidle")
-        await page.wait_for_timeout(random.randint(3000, 5000))
+        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "article")))
+    except Exception:
+        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "img")))
+    time.sleep(random.randint(3, 5))
 
-        try:
-            await page.wait_for_selector("article", timeout=10000)
-        except Exception:
-            await page.wait_for_selector("img", timeout=10000)
+    caption = ""
+    if h1s := driver.find_elements(By.XPATH, "//article//h1"):
+        caption = h1s[0].text
+    if not caption:
+        if metas := driver.find_elements(By.XPATH, '//meta[@property="og:description"]'):
+            raw = metas[0].get_attribute("content") or ""
+            caption = raw.split(": ", 1)[1] if ": " in raw else raw
 
-        caption = ""
-        h1s = await page.evaluate("""() =>
-            Array.from(document.querySelectorAll('article h1')).map(el => el.textContent)
-        """)
-        if h1s:
-            caption = h1s[0]
-        if not caption:
-            meta = await page.evaluate("""() => {
-                const el = document.querySelector('meta[property="og:description"]');
-                return el ? el.content : '';
-            }""")
-            if meta:
-                caption = meta.split(": ", 1)[1] if ": " in meta else meta
+    caption = _normalize_ig_caption(caption or driver.title)
+    if not caption or not is_mahasiswa(caption):
+        return None
 
-        caption = _normalize_ig_caption(caption or await page.title())
-        if not caption or not is_mahasiswa(caption):
-            return None
+    uid = make_id(_ig_shortcode(url), f"IG @{account}")
+    if uid in seen_ids:
+        return None
 
-        uid = make_id(_ig_shortcode(url), f"IG @{account}")
-        if uid in seen_ids:
-            return None
+    poster = driver.execute_script(_IG_POSTER_JS)
+    if not poster:
+        if og := driver.find_elements(By.XPATH, '//meta[@property="og:image"]'):
+            poster = og[0].get_attribute("content") or ""
 
-        poster = await page.evaluate(_IG_POSTER_JS)
-        if not poster:
-            poster = await page.evaluate("""() => {
-                const el = document.querySelector('meta[property="og:image"]');
-                return el ? el.content : '';
-            }""")
-
-        title = extract_title_from_caption(caption)
-        return _build_item(
-            uid, f"IG @{account}",
-            title, poster, caption,
-            extract_registration_links(caption),
-            url,
-        )
-    finally:
-        await page.close()
+    title = extract_title_from_caption(caption)
+    return _build_item(
+        uid, f"IG @{account}",
+        title,
+        poster, caption,
+        extract_registration_links(caption),
+        url,
+    )
 
 
-async def scrape_instagram(seen_ids: set) -> list:
+def scrape_instagram(seen_ids: set) -> list:
     if not IG_SESSION_ID:
-        logger.warning("[IG] IG_SESSION_ID not set, skipping.")
+        print("[IG] IG_SESSION_ID not set, skipping.")
         return []
 
-    logger.info("[IG] Starting...")
+    print("[IG] Starting...")
     results = []
+    driver = _build_chrome_driver()
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, timeout=30000)
-        context = await browser.new_context(user_agent=HEADERS["User-Agent"])
-        page = await context.new_page()
+    try:
+        driver.get("https://www.instagram.com/")
+        time.sleep(3)
+        driver.add_cookie({"name": "sessionid", "value": IG_SESSION_ID, "domain": ".instagram.com"})
+        driver.refresh()
+        time.sleep(5)
+        if "login" in driver.current_url.lower():
+            print("[IG] Invalid session.")
+            return []
 
-        try:
-            await page.goto("https://www.instagram.com/", wait_until="networkidle")
-            await page.wait_for_timeout(3000)
-
-            await context.add_cookies([{
-                "name": "sessionid",
-                "value": IG_SESSION_ID,
-                "domain": ".instagram.com",
-                "path": "/",
-            }])
-
-            await page.reload()
-            await page.wait_for_timeout(5000)
-
-            if "login" in page.url.lower():
-                logger.error("[IG] Invalid session.")
-                return []
-
-            for account in IG_ACCOUNTS:
+        for account in IG_ACCOUNTS:
+            post_urls = _collect_post_urls(driver, account)
+            for url in post_urls[:MAX_IG_POSTS_PER_ACCOUNT]:
                 try:
-                    post_urls = await _collect_post_urls(page, account)
-                    for url in post_urls[:MAX_IG_POSTS_PER_ACCOUNT]:
-                        try:
-                            item = await _scrape_ig_post(browser, url, account, seen_ids)
-                            if item:
-                                results.append(item)
-                                seen_ids.add(item["id"])
-                        except Exception as exc:
-                            logger.exception("[IG] Skip post %s: %s", url, exc)
+                    item = _scrape_ig_post(driver, url, account, seen_ids)
+                    if item:
+                        results.append(item)
+                        seen_ids.add(item["id"])
                 except Exception as exc:
-                    logger.exception("[IG] Error collecting posts for %s: %s", account, exc)
+                    print(f"[IG] Skip post {url}: {exc}")
 
-        except Exception as exc:
-            logger.exception("[IG] Error: %s", exc)
-        finally:
-            await browser.close()
+    except Exception as exc:
+        print(f"[IG] Error: {exc}")
+    finally:
+        driver.quit()
 
-    logger.info("[IG] Done: %d items", len(results))
+    print(f"[IG] Done: {len(results)} items")
     return results
 
 
@@ -1460,10 +1317,10 @@ def dedup_results(new_items: list, db_data: list, threshold: float = 0.6) -> lis
         link = item.get("link_direct", "")
 
         if link and link in db_direct_urls:
-            logger.info("[DEDUP] Skip duplicate URL: %s", link)
+            print(f"[DEDUP] Skip duplicate URL: {link}")
             continue
         if any(_jaccard(token, db_tok) >= threshold for db_tok in db_tokens):
-            logger.info("[DEDUP] Skip title similar to DB: %r", item['judul'])
+            print(f"[DEDUP] Skip title similar to DB: {item['judul']!r}")
             continue
 
         dup_idx = next(
@@ -1477,14 +1334,14 @@ def dedup_results(new_items: list, db_data: list, threshold: float = 0.6) -> lis
             if SOURCE_PRIORITY.get(item["sumber"], 2) < SOURCE_PRIORITY.get(existing["sumber"], 2):
                 item["link_pendaftaran"] = merged
                 unique[dup_idx] = item
-                logger.info("[DEDUP] Replace %s -> %s: %r", existing['sumber'], item['sumber'], item['judul'])
+                print(f"[DEDUP] Replace {existing['sumber']} -> {item['sumber']}: {item['judul']!r}")
             else:
                 unique[dup_idx]["link_pendaftaran"] = merged
-                logger.info("[DEDUP] Merge links %s -> %s: %r", item['sumber'], existing['sumber'], item['judul'])
+                print(f"[DEDUP] Merge links {item['sumber']} -> {existing['sumber']}: {item['judul']!r}")
         else:
             unique.append(item)
 
-    logger.info("[DEDUP] %d -> %d unique items.", len(new_items), len(unique))
+    print(f"[DEDUP] {len(new_items)} -> {len(unique)} unique items.")
     return unique
 
 
@@ -1496,50 +1353,43 @@ async def main():
     if not MONGO_URI:
         raise RuntimeError("MONGO_URI is not set.")
 
-    if MONGO_URI and not MONGO_URI.startswith("mongodb"):
-        raise RuntimeError("MONGO_URI does not look valid (must start with mongodb:// or mongodb+srv://).")
-
-    if IG_ACCOUNTS and not IG_SESSION_ID:
-        logger.warning("IG_ACCOUNTS set but IG_SESSION_ID is empty — Instagram will be skipped.")
-
-    logger.info("[INFO] Connecting to MongoDB...")
+    print("[INFO] Connecting to MongoDB...")
     client = pymongo.MongoClient(MONGO_URI)
     collection = client[DB_NAME][COLLECTION]
 
     db_data = list(collection.find({}, {"id": 1, "link_direct": 1, "judul": 1, "_id": 0}))
     seen_ids = {d["id"] for d in db_data if "id" in d}
-    logger.info("[INFO] %d existing records in DB.", len(seen_ids))
+    print(f"[INFO] {len(seen_ids)} existing records in DB.")
 
     batches = await asyncio.gather(
         asyncio.to_thread(scrape_infolomba, seen_ids),
         scrape_silomba(seen_ids),
-        scrape_instagram(seen_ids),
+        asyncio.to_thread(scrape_instagram, seen_ids),
     )
     raw = [item for batch in batches if isinstance(batch, list) for item in batch]
-    logger.info("[INFO] %d new raw items found.", len(raw))
+    print(f"[INFO] {len(raw)} new raw items found.")
 
     if not raw:
-        logger.info("[INFO] No new data.")
+        print("[INFO] No new data.")
         client.close()
         return
 
     processed = []
-    llm_batch = int(os.environ.get("LLM_BATCH_SIZE", "5"))
-    for i in range(0, len(raw), llm_batch):
-        batch = raw[i: i + llm_batch]
-        logger.info("[LLM] Batch %d (%d items)...", i // llm_batch + 1, len(batch))
+    for i in range(0, len(raw), 15):
+        batch = raw[i: i + 15]
+        print(f"[LLM] Batch {i // 15 + 1} ({len(batch)} items)...")
         processed.extend(process_batch_with_openrouter(batch))
 
     final = dedup_results(processed, db_data)
     if not final:
-        logger.info("[INFO] All items are duplicates.")
+        print("[INFO] All items are duplicates.")
         client.close()
         return
 
     result = collection.bulk_write(
         [UpdateOne({"id": item["id"]}, {"$set": item}, upsert=True) for item in final]
     )
-    logger.info("[INFO] Saved: %d new, %d updated.", result.upserted_count, result.modified_count)
+    print(f"[INFO] Saved: {result.upserted_count} new, {result.modified_count} updated.")
     client.close()
 
 
