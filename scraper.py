@@ -444,6 +444,7 @@ def _extract_deadline_context(text: str) -> str:
         "deadline", "batas", "pendaftaran", "registrasi", "registration",
         "penutupan", "terakhir", "close", "closing", "due date", "submit",
         "submission", "pengumpulan", "tenggat", "berakhir",
+        "paling lambat", "sampai dengan", "ditutup", "hingga", "s.d.",
     }
     
     lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
@@ -452,8 +453,9 @@ def _extract_deadline_context(text: str) -> str:
     for idx, line in enumerate(lines):
         lower = line.lower()
         if any(kw in lower for kw in deadline_keywords):
-            # Ambil baris ini + 2 baris setelahnya sebagai konteks
-            context = " ".join(lines[idx:min(len(lines), idx + 3)])
+            # Ambil 1 baris sebelumnya + baris ini + 2 baris setelahnya
+            start = max(0, idx - 1)
+            context = " ".join(lines[start:min(len(lines), idx + 3)])
             deadline_lines.append(context)
     
     return " ".join(deadline_lines) if deadline_lines else ""
@@ -842,78 +844,113 @@ def extract_registration_links(text: str = "", anchors: list[dict] | None = None
 # LLM (OpenRouter DeepSeek) helpers
 # ---------------------------------------------------------------------------
 
+_LLM_CACHE: dict[str, list] = {}
+_LLM_LAST_CALL = 0.0
+
 def _call_openrouter(prompt: str) -> list:
     """
-    Call OpenRouter API dengan DeepSeek v4 Flash (free tier)
+    Call OpenRouter API dengan retry & rate-limit handling.
     """
     if not OPENROUTER_API_KEY:
         logger.warning("[LLM] OPENROUTER_API_KEY not set, skipping LLM processing")
         return []
-    
-    try:
-        response = requests.post(
-            url="https://openrouter.io/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "HTTP-Referer": "https://github.com",
-                "X-Title": "Competition Scraper",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "deepseek/deepseek-v4-flash:free",
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                "temperature": 0.3,
-                "max_tokens": 2000,
-            },
-            timeout=60
-        )
-        
-        if response.status_code != 200:
+
+    cache_key = hashlib.md5(prompt.encode()).hexdigest()
+    cached = _LLM_CACHE.get(cache_key)
+    if cached is not None:
+        logger.info("[LLM] Using cached result for this prompt.")
+        return cached
+
+    models = [
+        "deepseek/deepseek-v4-flash:free",
+        "google/gemini-2.0-flash-exp:free",
+        "mistralai/mistral-7b-instruct:free",
+    ]
+
+    for attempt in range(6):
+        global _LLM_LAST_CALL
+        since_last = time.time() - _LLM_LAST_CALL
+        if since_last < 2.0:
+            time.sleep(2.0 - since_last)
+
+        model = models[attempt % len(models)]
+        try:
+            response = requests.post(
+                url="https://openrouter.io/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "HTTP-Referer": "https://github.com",
+                    "X-Title": "Competition Scraper",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.3,
+                    "max_tokens": 2000,
+                },
+                timeout=90
+            )
+            _LLM_LAST_CALL = time.time()
+
+            if response.status_code == 200:
+                result = response.json()
+                content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                data = safe_json_loads(content)
+                if isinstance(data, list):
+                    _LLM_CACHE[cache_key] = data
+                    return data
+                logger.warning("[LLM] Response not a list, retrying...")
+                continue
+
+            if response.status_code == 429:
+                retry_after = int(response.headers.get("Retry-After", 30))
+                logger.warning("[LLM] Rate limited (429) on %s, waiting %ds...", model, retry_after)
+                time.sleep(retry_after)
+                continue
+
+            if response.status_code >= 500:
+                logger.warning("[LLM] Server error %s on %s, retrying...", response.status_code, model)
+                time.sleep(5 * (attempt + 1))
+                continue
+
             logger.error("[LLM] Error %s: %s", response.status_code, response.text)
             return []
-        
-        result = response.json()
-        content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-        
-        # Try to parse JSON from response
-        data = safe_json_loads(content)
-        return data if isinstance(data, list) else []
-        
-    except Exception as exc:
-        logger.exception("[LLM] Error: %s", exc)
-        return []
+
+        except requests.ConnectionError:
+            logger.warning("[LLM] Connection error on %s, retrying...", model)
+            time.sleep(10)
+        except requests.Timeout:
+            logger.warning("[LLM] Timeout on %s, retrying...", model)
+            time.sleep(5)
+        except Exception as exc:
+            logger.exception("[LLM] Error: %s", exc)
+            return []
+
+    logger.error("[LLM] All retries exhausted.")
+    return []
 
 
 _VALID_KATEGORI = frozenset(KATEGORI_CONFIG.keys()) | {"Lainnya"}
 
 _LLM_PROMPT_PREFIX = (
-    "Rapikan data lomba untuk mahasiswa. Untuk setiap item, kembalikan JSON array "
-    '{"id":"id","judul":"judul resmi","deadline":"timeline","kategori":"kategori","penyelenggara":"penyelenggara"}. '
-    "Field judul harus berupa nama lomba/program/event saja, tanpa emoji, sapaan, label "
-    "pendaftaran, tanggal, atau URL. "
-    "Field deadline adalah timeline gabungan dari tanggal awal sampai akhir "
-    "(cth: '23-28 Januari 2026' atau '23 Januari - 28 Februari 2026'), kosongkan jika tidak ada. "
-    "Field kategori HARUS salah satu dari: "
-    "IT, Bisnis, Webdev, Design, Poster, Data, Mobile, Game, Multimedia, IoT, Robotics, "
-    "Karya Tulis, Debat, Seni & Sastra, Lainnya. "
-    "Field penyelenggara adalah nama organisasi atau institusi penyelenggara (kosongkan jika tidak ada). "
-    "Ekstrak dari caption yang diberikan. "
-    "Jika tidak yakin, pertahankan data yang sudah ada atau isi dengan string kosong.\n\nData: "
+    "Rapikan data lomba. Kembalikan JSON array dengan field: id, judul, deadline, kategori, penyelenggara.\n"
+    "- judul: nama lomba, tanpa emoji/sapaan/URL/tanggal\n"
+    "- deadline: timeline (cth '23-28 Januari 2026'), kosongkan jika tidak ada\n"
+    "- kategori: salah satu dari IT, Bisnis, Webdev, Design, Poster, Data, Mobile, Game, Multimedia, IoT, Robotics, Karya Tulis, Debat, Seni & Sastra, Lainnya\n"
+    "- penyelenggara: nama institusi penyelenggara\n"
+    "Jika tidak yakin, pertahankan data yang sudah ada.\n\nData:\n"
 )
 
 
 def _item_needs_llm(item: dict) -> bool:
     """Check apakah item butuh LLM processing (ada field kosong/lemah)."""
+    judul = item.get("judul", "")
+    has_judul = bool(judul) and judul not in ("Tanpa Judul", "") and len(judul) >= 5
     has_deadline = bool(item.get("deadline"))
     has_kategori = item.get("kategori", "Lainnya") != "Lainnya"
     has_penyelenggara = bool(item.get("penyelenggara"))
-    # Butuh LLM jika salah satu field masih kosong
-    return not (has_deadline and has_kategori and has_penyelenggara)
+    return not (has_judul and has_deadline and has_kategori and has_penyelenggara)
 
 
 def process_batch_with_openrouter(batch: list) -> list:
@@ -944,7 +981,7 @@ def process_batch_with_openrouter(batch: list) -> list:
         {
             "id": item["id"],
             "judul": item.get("judul", ""),
-            "caption": item.get("caption", "")[:1000],
+            "caption": item.get("caption", "")[:500],
             "deadline": item.get("deadline", ""),
             "kategori": item.get("kategori", ""),
         }
@@ -964,8 +1001,9 @@ def process_batch_with_openrouter(batch: list) -> list:
         if not row:
             continue
 
-        # Update judul jika LLM return yang lebih baik
-        if row.get("judul"):
+        # Update judul hanya jika judul hasil rule-based kosong/lemah
+        existing = item.get("judul", "")
+        if row.get("judul") and (existing in ("", "Tanpa Judul") or len(existing) < 5):
             title = clean_title(row["judul"])
             if title != "Tanpa Judul":
                 item["judul"] = title
@@ -1044,6 +1082,19 @@ def _create_scraper() -> requests.Session:
 # Scraper: infolomba.id
 # ---------------------------------------------------------------------------
 
+def _fetch_page_with_retry(scraper, url: str, max_retries: int = 2) -> requests.Response | None:
+    for attempt in range(max_retries + 1):
+        try:
+            resp = scraper.get(url, headers=HEADERS, timeout=60)
+            if resp.status_code < 500:
+                return resp
+        except requests.RequestException as exc:
+            logger.warning("[infolomba] Attempt %d/%d failed: %s", attempt + 1, max_retries + 1, exc)
+            if attempt < max_retries:
+                time.sleep(5 * (attempt + 1))
+    return None
+
+
 def scrape_infolomba(seen_ids: set) -> list:
     logger.info("[infolomba] Starting...")
     base_url = "https://infolomba.id"
@@ -1051,7 +1102,9 @@ def scrape_infolomba(seen_ids: set) -> list:
     results = []
 
     try:
-        resp = scraper.get(base_url, headers=HEADERS, timeout=30)
+        resp = _fetch_page_with_retry(scraper, base_url)
+        if resp is None:
+            return results
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -1150,10 +1203,10 @@ async def scrape_silomba(seen_ids: set) -> list:
     results = []
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(headless=True, timeout=30000)
         try:
             page = await browser.new_page(user_agent=HEADERS["User-Agent"])
-            await page.goto(base_url, wait_until="networkidle", timeout=45000)
+            await page.goto(base_url, wait_until="load", timeout=60000)
             await page.wait_for_selector("#competition-section", timeout=15000)
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(2000)
@@ -1219,8 +1272,11 @@ async def scrape_silomba(seen_ids: set) -> list:
 # ---------------------------------------------------------------------------
 
 def _normalize_ig_caption(raw: str) -> str:
-    caption = re.sub(r"^\s*[^:\n]{1,80}\s+on Instagram:\s*", "", (raw or "").strip(), flags=re.I)
-    return re.sub(r'^\s*"|\"\s*$', "", caption).strip()
+    caption = (raw or "").strip()
+    caption = re.sub(r"^\s*[^:\n]{1,80}\s+on Instagram:\s*", "", caption, flags=re.I)
+    caption = re.sub(r"^\s*@?\w+\s*(•|on Instagram)?\s*", "", caption, flags=re.I)
+    caption = re.sub(r'^\s*"|\"\s*$', "", caption)
+    return caption.strip()
 
 
 def _ig_shortcode(url: str) -> str:
@@ -1228,7 +1284,7 @@ def _ig_shortcode(url: str) -> str:
     return match.group(1) if match else url
 
 
-_IG_POSTER_JS = """
+_IG_POSTER_JS = """() => {
 const imgs = Array.from(document.querySelectorAll('article img'));
 for (const img of imgs) {
   const src = img.currentSrc || img.src || '';
@@ -1237,7 +1293,7 @@ for (const img of imgs) {
   if (src.includes('scontent') || src.includes('cdninstagram')) return src;
 }
 return '';
-"""
+}"""
 
 
 async def _collect_post_urls(page, account: str) -> list[str]:
@@ -1329,7 +1385,7 @@ async def scrape_instagram(seen_ids: set) -> list:
     results = []
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(headless=True, timeout=30000)
         context = await browser.new_context(user_agent=HEADERS["User-Agent"])
         page = await context.new_page()
 
@@ -1468,9 +1524,10 @@ async def main():
         return
 
     processed = []
-    for i in range(0, len(raw), 15):
-        batch = raw[i: i + 15]
-        logger.info("[LLM] Batch %d (%d items)...", i // 15 + 1, len(batch))
+    llm_batch = int(os.environ.get("LLM_BATCH_SIZE", "5"))
+    for i in range(0, len(raw), llm_batch):
+        batch = raw[i: i + llm_batch]
+        logger.info("[LLM] Batch %d (%d items)...", i // llm_batch + 1, len(batch))
         processed.extend(process_batch_with_openrouter(batch))
 
     final = dedup_results(processed, db_data)
