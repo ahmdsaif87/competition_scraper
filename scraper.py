@@ -52,7 +52,7 @@ HEADERS = {
 # Compiled patterns
 # ---------------------------------------------------------------------------
 
-URL_RE = re.compile(r"https?://[^\s<>'\"`)\]}]+", re.IGNORECASE)
+URL_RE = re.compile(r"https?://[^\s<>'\"`)}\]]+", re.IGNORECASE)
 INSTAGRAM_SHORTCODE_RE = re.compile(r"/(?:p|reel)/([^/?#]+)/?")
 TITLE_PREFIX_RE = re.compile(
     r"^\s*(?:judul|title|nama\s+lomba|competition|event)\s*[:\-]\s*", re.IGNORECASE
@@ -76,17 +76,7 @@ DEDUP_STOPWORDS = {"the", "of", "and", "in", "on", "at", "to", "a", "an", "di", 
 SOURCE_PRIORITY = {"infolomba.id": 0, "silomba.id": 1}
 
 # ---------------------------------------------------------------------------
-# Kategori system (REFACTORED — word-boundary matching)
-# ---------------------------------------------------------------------------
-#
-# Setiap kategori punya:
-#   - "phrases": multi-word phrases (high confidence, +20 per match)
-#   - "words":   single words matched with \b boundary (+10 per match)
-#   - "exclude": jika kata ini muncul, skip kategori ini (anti false-positive)
-#   - "priority": tiebreaker (lower = lebih prioritas)
-#
-# PENTING: Semua matching pakai regex word-boundary (\b), bukan substring.
-# Ini mencegah "it" match di "submit", "ai" match di "sampai", dll.
+# Kategori system (word-boundary matching)
 # ---------------------------------------------------------------------------
 
 KATEGORI_CONFIG = {
@@ -272,16 +262,13 @@ KATEGORI_CONFIG = {
     },
 }
 
-# Pre-compile regex patterns per kategori untuk performa
+# Pre-compile regex patterns per kategori
 _KATEGORI_COMPILED: dict[str, dict] = {}
 for _kat, _cfg in KATEGORI_CONFIG.items():
     _compiled = {"priority": _cfg["priority"], "exclude": _cfg["exclude"]}
-
-    # Compile phrase patterns (match as substring, case-insensitive)
     _compiled["phrase_patterns"] = [
         re.compile(re.escape(p), re.IGNORECASE) for p in _cfg["phrases"]
     ]
-    # Compile word patterns (match with word boundary)
     _compiled["word_patterns"] = [
         re.compile(r"\b" + re.escape(w) + r"\b", re.IGNORECASE) for w in _cfg["words"]
     ]
@@ -302,33 +289,50 @@ MONTH_MAP = {
     "desember": "Desember", "december": "Desember", "dec": "Desember",
 }
 
-# Build regex alternation from valid month names only
 _MONTH_NAMES_RE = "|".join(sorted(MONTH_MAP.keys(), key=len, reverse=True))
 
-# FIXED: Date range pattern — only matches valid month names, not arbitrary words
+# Month order for comparison
+_MONTH_ORDER = {
+    "Januari": 1, "Februari": 2, "Maret": 3, "April": 4,
+    "Mei": 5, "Juni": 6, "Juli": 7, "Agustus": 8,
+    "September": 9, "Oktober": 10, "November": 11, "Desember": 12,
+}
+
+# Date range: "13 - 19 Mei 2026" or "13-19 Mei 2026"
 TIMELINE_PATTERN = re.compile(
-    r"(\d{1,2})\s*[-–—]\s*(\d{1,2})\s+(" + _MONTH_NAMES_RE + r")\s*(\d{4})?",
+    r"(\d{1,2})\s*[-–—]\s*(\d{1,2})\s+(" + _MONTH_NAMES_RE + r")(?:\s+(\d{4}))?",
     re.IGNORECASE
 )
 
-# FIXED: Single date pattern — only matches valid month names
+# Cross-month range: "7 Juni - 5 Juli 2026" or "7 Jun - 5 Jul 2026"
+CROSS_MONTH_PATTERN = re.compile(
+    r"(\d{1,2})\s+(" + _MONTH_NAMES_RE + r")\s*[-–—]\s*(\d{1,2})\s+(" + _MONTH_NAMES_RE + r")(?:\s+(\d{4}))?",
+    re.IGNORECASE
+)
+
+# Single date: "7 Juni 2026" or "7 Juni"
 SINGLE_DATE_PATTERN = re.compile(
     r"(\d{1,2})\s+(" + _MONTH_NAMES_RE + r")(?:\s+(\d{4}))?",
     re.IGNORECASE
 )
 
-# Pattern: "BulanNama dd, yyyy" atau "BulanNama dd yyyy" (English-style dates)
+# English-style: "June 15, 2026"
 ENGLISH_DATE_PATTERN = re.compile(
     r"(" + _MONTH_NAMES_RE + r")\s+(\d{1,2})(?:\s*,\s*|\s+)(\d{4})",
     re.IGNORECASE
 )
 
-# Pattern: "dd/mm/yyyy" atau "dd-mm-yyyy"
+# Numeric: "15/06/2026" or "15-06-2026"
 NUMERIC_DATE_PATTERN = re.compile(
     r"(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})"
 )
 
-# Month number to name mapping for numeric dates
+# Infolomba tanggal format in listing cards: "14 Jun - 22 Jul 2026"
+INFOLOMBA_DATE_RE = re.compile(
+    r"(\d{1,2})\s+(" + _MONTH_NAMES_RE + r")\s*-\s*(\d{1,2})\s+(" + _MONTH_NAMES_RE + r")\s+(\d{4})",
+    re.IGNORECASE
+)
+
 _MONTH_NUM_MAP = {
     1: "Januari", 2: "Februari", 3: "Maret", 4: "April",
     5: "Mei", 6: "Juni", 7: "Juli", 8: "Agustus",
@@ -361,6 +365,8 @@ def clean_url(url: str, base_url: str = "") -> str:
     if url.startswith("//"):
         url = "https:" + url
     elif base_url and url.startswith("/"):
+        url = urljoin(base_url, url)
+    elif base_url and not url.startswith(("http://", "https://")):
         url = urljoin(base_url, url)
     return url if url.startswith(("http://", "https://")) else ""
 
@@ -413,125 +419,131 @@ def is_non_registration_context(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Timeline & Kategori extraction (REFACTORED)
+# Timeline & Kategori extraction
 # ---------------------------------------------------------------------------
 
 def _normalize_month(month_str: str) -> str:
-    """Normalize bulan ke format Bulan penuh"""
     return MONTH_MAP.get(month_str.lower().strip(), "")
 
 
-def _is_valid_month(month_str: str) -> bool:
-    """Check apakah string adalah nama bulan yang valid"""
-    return month_str.lower().strip() in MONTH_MAP
-
-
 def _is_valid_day(day: int) -> bool:
-    """Check apakah day masuk akal (1-31)"""
     return 1 <= day <= 31
+
+
+def _date_tuple(day: int, month: str, year: str) -> tuple[int, int, int]:
+    """Return (year, month_num, day) for comparison."""
+    return (int(year), _MONTH_ORDER.get(month, 0), day)
 
 
 def _extract_deadline_context(text: str) -> str:
     """
-    Cari bagian text yang berisi konteks deadline/pendaftaran.
-    Prioritaskan kalimat yang mengandung keyword deadline.
+    Extract lines containing deadline keywords + surrounding context.
     """
     deadline_keywords = {
         "deadline", "batas", "pendaftaran", "registrasi", "registration",
         "penutupan", "terakhir", "close", "closing", "due date", "submit",
         "submission", "pengumpulan", "tenggat", "berakhir",
     }
-    
+
     lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
     deadline_lines = []
-    
+
     for idx, line in enumerate(lines):
         lower = line.lower()
         if any(kw in lower for kw in deadline_keywords):
-            # Ambil baris ini + 2 baris setelahnya sebagai konteks
             context = " ".join(lines[idx:min(len(lines), idx + 3)])
             deadline_lines.append(context)
-    
+
     return " ".join(deadline_lines) if deadline_lines else ""
 
 
 def extract_timeline(text: str) -> str:
     """
-    REFACTORED: Extract timeline/deadline dengan akurat.
-    
-    Strategi:
-    1. Cari konteks deadline dulu (baris dengan keyword "deadline", "pendaftaran", dll)
-    2. Dari konteks tersebut, extract tanggal
-    3. Jika tidak ada konteks deadline, fallback ke semua text
-    4. Hanya match nama bulan yang VALID (dari MONTH_MAP)
-    5. Validasi day range (1-31)
-    
-    Format output:
-    - "dd-dd Bulan yyyy" (range dalam 1 bulan)
-    - "dd Bulan - dd Bulan yyyy" (range antar bulan)
-    - "dd Bulan yyyy" (single date)
-    - "" (tidak ditemukan)
+    Extract timeline/deadline. Strategies:
+    1. Search deadline context first
+    2. Fallback to full text
+    3. Only match valid month names
+    4. Support cross-month ranges (e.g., "7 Juni - 5 Juli 2026")
+    5. Validate day ranges properly
     """
     if not text:
         return ""
-    
-    # Coba cari dari konteks deadline dulu
+
     deadline_ctx = _extract_deadline_context(text)
-    
-    # Urutan pencarian: konteks deadline > full text
     search_texts = [deadline_ctx, text] if deadline_ctx else [text]
-    
+
     for search_text in search_texts:
         result = _extract_dates_from_text(search_text)
         if result:
             return result
-    
+
     return ""
 
 
 def _extract_dates_from_text(text: str) -> str:
-    """
-    Extract tanggal dari text. Hanya match bulan yang valid.
-    Returns formatted date string atau empty string.
-    """
     if not text:
         return ""
-    
-    # Strategy 1: Date range "13 - 19 Mei 2026" atau "13-19 Mei 2026"
+
+    # Strategy 1: Cross-month range "7 Juni - 5 Juli 2026"
+    cross_matches = []
+    for match in CROSS_MONTH_PATTERN.finditer(text):
+        d1, m1, d2, m2, y = match.groups()
+        m1_norm = _normalize_month(m1)
+        m2_norm = _normalize_month(m2)
+        if not (m1_norm and m2_norm):
+            continue
+        day1, day2 = int(d1), int(d2)
+        if not (_is_valid_day(day1) and _is_valid_day(day2)):
+            continue
+        year = y if y else "2026"
+        # Validate chronological order (month1 should be <= month2)
+        t1 = _date_tuple(day1, m1_norm, year)
+        t2 = _date_tuple(day2, m2_norm, year)
+        if t2 < t1:
+            # Swap if reversed
+            day1, day2 = day2, day1
+            m1_norm, m2_norm = m2_norm, m1_norm
+        cross_matches.append({
+            "start_day": day1, "start_month": m1_norm,
+            "end_day": day2, "end_month": m2_norm,
+            "year": year, "start_pos": match.start(),
+        })
+
+    if cross_matches:
+        cross_matches.sort(key=lambda x: x["start_pos"])
+        # Use the last cross-month range (most likely the deadline)
+        last = cross_matches[-1]
+        if last["start_month"] == last["end_month"]:
+            return f"{last['start_day']}-{last['end_day']} {last['start_month']} {last['year']}"
+        return f"{last['start_day']} {last['start_month']} - {last['end_day']} {last['end_month']} {last['year']}"
+
+    # Strategy 2: Same-month date range "13-19 Mei 2026"
     range_matches = []
     for match in TIMELINE_PATTERN.finditer(text):
         day_start_s, day_end_s, month_s, year_s = match.groups()
         month_norm = _normalize_month(month_s)
-        if not month_norm:  # Bulan tidak valid
+        if not month_norm:
             continue
         day_start, day_end = int(day_start_s), int(day_end_s)
         if not (_is_valid_day(day_start) and _is_valid_day(day_end)):
             continue
-        if day_end < day_start:  # End harus >= start dalam satu bulan
-            continue
+        # Same month: end should >= start; if not, swap
+        if day_end < day_start:
+            day_start, day_end = day_end, day_start
         year_str = year_s if year_s else "2026"
         range_matches.append({
-            "start_day": day_start,
-            "end_day": day_end,
-            "month": month_norm,
-            "year": year_str,
+            "start_day": day_start, "end_day": day_end,
+            "month": month_norm, "year": year_str,
             "start_pos": match.start(),
         })
-    
+
     if range_matches:
         range_matches.sort(key=lambda x: x["start_pos"])
-        first = range_matches[0]
-        all_months = set(m["month"] for m in range_matches)
-        
-        if len(all_months) == 1:
-            min_day = min(m["start_day"] for m in range_matches)
-            max_day = max(m["end_day"] for m in range_matches)
-            return f"{min_day}-{max_day} {first['month']} {first['year']}"
-        else:
-            last = range_matches[-1]
-            return f"{first['start_day']} {first['month']} - {last['end_day']} {last['month']} {last['year']}"
-    
-    # Strategy 2: English-style dates "June 15, 2026"
+        # Use the last match (most likely the deadline/closing date)
+        last = range_matches[-1]
+        return f"{last['start_day']}-{last['end_day']} {last['month']} {last['year']}"
+
+    # Strategy 3: English-style dates "June 15, 2026"
     eng_matches = []
     for match in ENGLISH_DATE_PATTERN.finditer(text):
         month_s, day_s, year_s = match.groups()
@@ -542,23 +554,22 @@ def _extract_dates_from_text(text: str) -> str:
         if not _is_valid_day(day):
             continue
         eng_matches.append({
-            "day": day,
-            "month": month_norm,
-            "year": year_s,
-            "start_pos": match.start(),
+            "day": day, "month": month_norm,
+            "year": year_s, "start_pos": match.start(),
         })
-    
+
     if eng_matches:
         eng_matches.sort(key=lambda x: x["start_pos"])
         if len(eng_matches) >= 2:
             first, last = eng_matches[0], eng_matches[-1]
             if first["month"] == last["month"]:
-                return f"{first['day']}-{last['day']} {first['month']} {last['year']}"
+                d1, d2 = min(first["day"], last["day"]), max(first["day"], last["day"])
+                return f"{d1}-{d2} {first['month']} {last['year']}"
             return f"{first['day']} {first['month']} - {last['day']} {last['month']} {last['year']}"
         m = eng_matches[0]
         return f"{m['day']} {m['month']} {m['year']}"
-    
-    # Strategy 3: Single dates "7 Juni 2026" atau "7 Juni"
+
+    # Strategy 4: Single dates "7 Juni 2026"
     single_matches = []
     for match in SINGLE_DATE_PATTERN.finditer(text):
         day_s, month_s, year_s = match.groups()
@@ -570,24 +581,28 @@ def _extract_dates_from_text(text: str) -> str:
             continue
         year_str = year_s if year_s else "2026"
         single_matches.append({
-            "day": day,
-            "month": month_norm,
-            "year": year_str,
-            "start_pos": match.start(),
+            "day": day, "month": month_norm,
+            "year": year_str, "start_pos": match.start(),
         })
-    
+
     if single_matches:
         single_matches.sort(key=lambda x: x["start_pos"])
         if len(single_matches) >= 2:
             first, last = single_matches[0], single_matches[-1]
             year_str = last["year"]
             if first["month"] == last["month"]:
-                return f"{first['day']}-{last['day']} {first['month']} {year_str}"
+                d1, d2 = min(first["day"], last["day"]), max(first["day"], last["day"])
+                return f"{d1}-{d2} {first['month']} {year_str}"
+            # Different months — ensure chronological order
+            t1 = _date_tuple(first["day"], first["month"], year_str)
+            t2 = _date_tuple(last["day"], last["month"], year_str)
+            if t2 < t1:
+                first, last = last, first
             return f"{first['day']} {first['month']} - {last['day']} {last['month']} {year_str}"
         m = single_matches[0]
         return f"{m['day']} {m['month']} {m['year']}"
-    
-    # Strategy 4: Numeric dates "15/06/2026" atau "15-06-2026"
+
+    # Strategy 5: Numeric dates "15/06/2026"
     num_matches = []
     for match in NUMERIC_DATE_PATTERN.finditer(text):
         d, m, y = int(match.group(1)), int(match.group(2)), match.group(3)
@@ -595,53 +610,38 @@ def _extract_dates_from_text(text: str) -> str:
             month_name = _MONTH_NUM_MAP.get(m, "")
             if month_name:
                 num_matches.append({
-                    "day": d,
-                    "month": month_name,
-                    "year": y,
-                    "start_pos": match.start(),
+                    "day": d, "month": month_name,
+                    "year": y, "start_pos": match.start(),
                 })
-    
+
     if num_matches:
         num_matches.sort(key=lambda x: x["start_pos"])
         if len(num_matches) >= 2:
             first, last = num_matches[0], num_matches[-1]
             if first["month"] == last["month"]:
-                return f"{first['day']}-{last['day']} {first['month']} {last['year']}"
+                d1, d2 = min(first["day"], last["day"]), max(first["day"], last["day"])
+                return f"{d1}-{d2} {first['month']} {last['year']}"
             return f"{first['day']} {first['month']} - {last['day']} {last['month']} {last['year']}"
         m = num_matches[0]
         return f"{m['day']} {m['month']} {m['year']}"
-    
+
     return ""
 
 
 def extract_kategori(text: str, title: str = "") -> str:
-    """
-    REFACTORED: Extract kategori dengan word-boundary regex matching.
-
-    Perbaikan utama:
-    - TIDAK lagi pakai substring matching (yang menyebabkan "it" match di "submit").
-    - Multi-word phrases diberi skor lebih tinggi (+20) daripada single words (+10).
-    - Exclusion keywords: jika "puisi" muncul, kategori Design di-skip.
-    - Minimum score threshold: butuh minimal 10 point untuk masuk kategori.
-    """
     combined = f"{title} {text}"
     combined_lower = combined.lower()
 
     scores: dict[str, int] = {}
 
     for kategori, compiled in _KATEGORI_COMPILED.items():
-        # Check exclusion keywords dulu (substring ok untuk exclusion)
         if compiled["exclude"] and any(ex in combined_lower for ex in compiled["exclude"]):
             continue
 
         score = 0
-
-        # Score phrases (+20 each — high confidence)
         for pat in compiled["phrase_patterns"]:
             if pat.search(combined):
                 score += 20
-
-        # Score words (+10 each — medium confidence, word-boundary)
         for pat in compiled["word_patterns"]:
             if pat.search(combined):
                 score += 10
@@ -652,7 +652,6 @@ def extract_kategori(text: str, title: str = "") -> str:
     if not scores:
         return "Lainnya"
 
-    # Sort by score descending, then by priority ascending (lower = better)
     best = max(
         scores.items(),
         key=lambda x: (x[1], -_KATEGORI_COMPILED[x[0]]["priority"]),
@@ -672,23 +671,81 @@ def anchor_rows(soup: BeautifulSoup, base_url: str = "") -> list[dict]:
     ]
 
 
-def best_poster_from_soup(soup: BeautifulSoup, base_url: str = "") -> str:
-    for tag, attr in [("meta", "og:image"), ("meta", "twitter:image")]:
-        node = soup.find(tag, attrs={"property": attr} if "og:" in attr else {"name": attr})
-        if node and (url := clean_url(node.get("content", ""), base_url)):
+# Images to skip when looking for posters
+_POSTER_SKIP_PATTERNS = (
+    "logo", "avatar", "profile", "favicon", "default-share",
+    "user.png", "coin.png", "map.png", "calendar.png",
+    "apple-touch-icon", "site.webmanifest",
+    "wave-header", "bg-header",
+)
+
+
+def _is_poster_url(src: str) -> bool:
+    """Check if a URL looks like an actual competition poster."""
+    lower = src.lower()
+    return not any(skip in lower for skip in _POSTER_SKIP_PATTERNS)
+
+
+def best_poster_from_soup(soup: BeautifulSoup, base_url: str = "", source: str = "") -> str:
+    """
+    FIXED: Extract poster image, skipping logos and default images.
+
+    For infolomba.id:
+    - Skip og:image because it's always the default-share.png logo
+    - Prioritize images from images/event/poster/ path
+    - Skip logo images (images/event/logo/)
+
+    For other sources: use og:image as fallback only if it's not a site logo.
+    """
+
+    # Strategy 1: Look for poster-specific images first (infolomba pattern)
+    for img in soup.find_all("img"):
+        src = img.get("src") or img.get("data-src") or img.get("data-lazy-src") or ""
+        url = clean_url(src, base_url)
+        if url and "images/event/poster/" in url.lower():
             return url
 
+    # Strategy 2: Look for image inside image-link or img-container
+    for container in soup.select("a.image-link, .img-container, .event-poster"):
+        img = container.find("img")
+        if img:
+            src = img.get("src") or img.get("data-src") or ""
+            url = clean_url(src, base_url)
+            if url and _is_poster_url(url):
+                return url
+
+    # Strategy 3: og:image / twitter:image (but skip known logos)
+    if "infolomba" not in source.lower():
+        for tag, attr in [("meta", "og:image"), ("meta", "twitter:image")]:
+            node = soup.find(tag, attrs={"property": attr} if "og:" in attr else {"name": attr})
+            if node:
+                url = clean_url(node.get("content", ""), base_url)
+                if url and _is_poster_url(url):
+                    return url
+
+    # Strategy 4: Any large img that's not a logo/icon
     for img in soup.find_all("img"):
         src = clean_url(
             img.get("src") or img.get("data-src") or img.get("data-lazy-src") or "", base_url
         )
-        if src and not any(skip in src.lower() for skip in ("logo", "avatar", "profile")):
+        if src and _is_poster_url(src):
+            # Extra check: skip very small icons by checking width/height attributes
+            w = img.get("width", "")
+            h = img.get("height", "")
+            style = img.get("style", "")
+            if w and str(w).isdigit() and int(w) < 50:
+                continue
+            if h and str(h).isdigit() and int(h) < 50:
+                continue
+            if "height: 30px" in style or "height: 40px" in style:
+                continue
             return src
+
     return ""
 
 
 # ---------------------------------------------------------------------------
-# Title extraction (REFACTORED)
+# Title extraction
 # ---------------------------------------------------------------------------
 
 def _line_has_url(line: str) -> bool:
@@ -702,34 +759,24 @@ def _is_noise_title(line: str) -> bool:
 
 
 def _score_title(line: str, position: int) -> int:
-    """IMPROVED: Better scoring untuk title extraction"""
     lower = line.lower()
-    score = 100 - (position * 5)  # Prefer earlier lines
-    
-    # High-value keywords
+    score = 100 - (position * 5)
+
     score += 40 * any(w in lower for w in {"lomba", "olimpiade", "competition", "contest"})
     score += 35 * any(w in lower for w in {"national", "nasional", "se-indonesia"})
     score += 30 * any(w in lower for w in {"championship", "tournament", "kompetisi"})
     score += 20 * any(w in lower for w in {"conference", "summit", "bootcamp", "program", "award"})
-    
-    # Structural indicators
+
     score += 15 * (line.isupper() and len(line) > 8)
     score += 10 * bool(re.search(r"\b20\d{2}\b", line))
-    
+
     return max(0, score)
 
 
 def extract_title_from_caption(caption: str) -> str:
-    """
-    IMPROVED: Extract title dengan logic yang lebih smart
-    - Prioritas 1: Official headers (CAPS, h1/h2 text)
-    - Prioritas 2: Lines dengan competition keywords
-    - Prioritas 3: First non-noise line
-    """
     lines = [normalize_space(l) for l in (caption or "").splitlines() if normalize_space(l)]
     candidates: list[tuple[int, str]] = []
 
-    # Pass 1: Cari lines dengan "open registration" pattern
     for idx, line in enumerate(lines[:20]):
         match = OPEN_REGISTRATION_RE.search(strip_emoji_and_symbols(line))
         if match:
@@ -737,42 +784,35 @@ def extract_title_from_caption(caption: str) -> str:
             if title != "Tanpa Judul":
                 candidates.append((_score_title(title, idx) + 50, title))
 
-    # Pass 2: Score all non-noise lines
     for idx, line in enumerate(lines[:25]):
         if _is_noise_title(line):
             continue
-        
         title = clean_title(line)
         if title != "Tanpa Judul":
             score = _score_title(title, idx)
-            # Bonus untuk lines yang match CAPS pattern (biasanya official title)
             if line.isupper() and len(line) > 10:
                 score += 30
             candidates.append((score, title))
 
     if candidates:
-        # Return highest scored title
         best = max(candidates)[1]
-        # Avoid returning obvious non-titles
         if best and best not in {"Tanpa Judul", "Hello Everyone"}:
             return best
 
-    # Fallback: return first substantial non-noise line
     for line in lines:
         if not _is_noise_title(line):
             title = clean_title(line)
             if title != "Tanpa Judul" and len(title) > 5:
                 return title
-    
+
     return "Tanpa Judul"
 
 
 # ---------------------------------------------------------------------------
-# Link extraction (REFACTORED)
+# Link extraction
 # ---------------------------------------------------------------------------
 
 def extract_urls_from_text(text: str) -> list[str]:
-    """Extract semua URLs dari text"""
     seen, result = set(), []
     for m in URL_RE.finditer(text or ""):
         url = clean_url(m.group(0))
@@ -783,20 +823,13 @@ def extract_urls_from_text(text: str) -> list[str]:
 
 
 def extract_registration_links(text: str = "", anchors: list[dict] | None = None) -> list[str]:
-    """
-    REFACTORED: Extract registration links dengan prioritas lebih jelas:
-    1. Form hosts (bit.ly, forms.gle, etc) - PRIMARY
-    2. Anchor links dengan registration context - SECONDARY
-    3. Text URLs dengan registration context - TERTIARY
-    """
     anchors = anchors or []
     found: list[str] = []
     seen = set()
 
-    # Strategy 1: Extract form hosts (highest priority)
     all_text_urls = extract_urls_from_text(text)
     all_anchor_urls = [row.get("url", "") for row in anchors if row.get("url")]
-    
+
     for raw_url in all_text_urls + all_anchor_urls:
         url = clean_url(raw_url)
         if url and url not in seen and not is_low_value_url(url):
@@ -805,26 +838,21 @@ def extract_registration_links(text: str = "", anchors: list[dict] | None = None
                 found.append(url)
                 seen.add(url)
 
-    # Strategy 2: Anchor links dengan registration context
     for row in anchors:
         url = clean_url(row.get("url", ""))
         if not url or url in seen or is_low_value_url(url):
             continue
-        
         label = row.get("label", "")
         if is_registration_context(label) and not is_non_registration_context(label):
             found.append(url)
             seen.add(url)
 
-    # Strategy 3: Text URLs dalam registration context
     lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
     for idx, line in enumerate(lines):
         urls = extract_urls_from_text(line)
         if not urls:
             continue
-        
         context = " ".join(lines[max(0, idx - 1): min(len(lines), idx + 2)])
-        
         if is_registration_context(context) and not is_non_registration_context(line):
             for url in urls:
                 if url not in seen:
@@ -839,13 +867,10 @@ def extract_registration_links(text: str = "", anchors: list[dict] | None = None
 # ---------------------------------------------------------------------------
 
 def _call_openrouter(prompt: str) -> list:
-    """
-    Call OpenRouter API dengan DeepSeek v4 Flash (free tier)
-    """
     if not OPENROUTER_API_KEY:
         print("[LLM] OPENROUTER_API_KEY not set, skipping LLM processing")
         return []
-    
+
     try:
         response = requests.post(
             url="https://openrouter.io/api/v1/chat/completions",
@@ -857,29 +882,22 @@ def _call_openrouter(prompt: str) -> list:
             },
             json={
                 "model": "deepseek/deepseek-v4-flash:free",
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
+                "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.3,
                 "max_tokens": 2000,
             },
             timeout=60
         )
-        
+
         if response.status_code != 200:
             print(f"[LLM] Error {response.status_code}: {response.text}")
             return []
-        
+
         result = response.json()
         content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-        
-        # Try to parse JSON from response
         data = safe_json_loads(content)
         return data if isinstance(data, list) else []
-        
+
     except Exception as exc:
         print(f"[LLM] Error: {exc}")
         return []
@@ -904,23 +922,16 @@ _LLM_PROMPT_PREFIX = (
 
 
 def _item_needs_llm(item: dict) -> bool:
-    """Check apakah item butuh LLM processing (ada field kosong/lemah)."""
     has_deadline = bool(item.get("deadline"))
     has_kategori = item.get("kategori", "Lainnya") != "Lainnya"
     has_penyelenggara = bool(item.get("penyelenggara"))
-    # Butuh LLM jika salah satu field masih kosong
     return not (has_deadline and has_kategori and has_penyelenggara)
 
 
 def process_batch_with_openrouter(batch: list) -> list:
-    """
-    Process batch items dengan OpenRouter DeepSeek.
-    OPTIMIZED: Skip LLM call jika semua field sudah terisi.
-    """
     if not batch:
         return batch
 
-    # Pre-extract timeline dan kategori dari text
     for item in batch:
         caption = item.get("caption", "")
         if not item.get("deadline"):
@@ -928,7 +939,6 @@ def process_batch_with_openrouter(batch: list) -> list:
         if not item.get("kategori") or item.get("kategori") == "Lainnya":
             item["kategori"] = extract_kategori(caption, item.get("judul", ""))
 
-    # Filter: hanya kirim item yang masih butuh LLM
     needs_llm = [item for item in batch if _item_needs_llm(item)]
     if not needs_llm:
         print(f"[LLM] All {len(batch)} items already complete, skipping LLM call.")
@@ -960,22 +970,18 @@ def process_batch_with_openrouter(batch: list) -> list:
         if not row:
             continue
 
-        # Update judul jika LLM return yang lebih baik
         if row.get("judul"):
             title = clean_title(row["judul"])
             if title != "Tanpa Judul":
                 item["judul"] = title
 
-        # Update deadline
         if row.get("deadline"):
             item["deadline"] = row["deadline"]
 
-        # Update kategori — VALIDATE terhadap daftar kategori yang valid
         llm_kat = row.get("kategori", "")
         if llm_kat and llm_kat in _VALID_KATEGORI and llm_kat != "Lainnya":
             item["kategori"] = llm_kat
 
-        # Update penyelenggara
         if row.get("penyelenggara"):
             item["penyelenggara"] = row["penyelenggara"]
 
@@ -988,9 +994,6 @@ def process_batch_with_openrouter(batch: list) -> list:
 # ---------------------------------------------------------------------------
 
 def _build_item(uid, source, title, poster, caption, links, direct_url) -> dict:
-    """
-    Build item dengan struktur JSON baru
-    """
     return {
         "id": uid,
         "caption": caption,
@@ -999,15 +1002,106 @@ def _build_item(uid, source, title, poster, caption, links, direct_url) -> dict:
         "kategori": extract_kategori(caption, title),
         "link_direct": direct_url,
         "link_pendaftaran": links,
-        "penyelenggara": "",  # Diisi oleh LLM atau parsing manual
+        "penyelenggara": "",
         "poster": poster,
         "sumber": source,
     }
 
 
 # ---------------------------------------------------------------------------
-# Scraper: infolomba.id
+# Scraper: infolomba.id  (REWRITTEN)
 # ---------------------------------------------------------------------------
+
+def _parse_infolomba_cards(soup: BeautifulSoup, base_url: str) -> list[dict]:
+    """
+    Parse competition cards from infolomba.id listing page.
+    
+    The page structure has two sections:
+    - .most-wanted (swiper): featured competitions
+    - .event-list (#eventsContainer): regular listing
+    
+    Each card has:
+    - a[href="info-..."] link to detail page
+    - img[src="images/event/poster/..."] poster image
+    - h4.event-title > a: title
+    - .tanggal: date info
+    - .penyelenggara span: organizer
+    """
+    cards = []
+    seen_links = set()
+
+    # Parse from event listing containers
+    for container in soup.select(".event-container"):
+        card = {}
+
+        # Extract link and title
+        title_link = container.select_one("h4.event-title a")
+        if not title_link:
+            continue
+
+        href = title_link.get("href", "")
+        if not href or not href.startswith("info-"):
+            continue
+        link = urljoin(base_url, href)
+        if link in seen_links:
+            continue
+        seen_links.add(link)
+
+        card["link"] = link
+        card["title"] = normalize_space(title_link.get_text(" "))
+
+        # Extract poster from img-container
+        img_container = container.select_one("a.img-container img, .img-container img")
+        if img_container:
+            src = img_container.get("src") or img_container.get("data-src") or ""
+            poster_url = clean_url(src, base_url)
+            if poster_url and "images/event/poster/" in poster_url:
+                card["poster"] = poster_url
+
+        # Extract date
+        tanggal = container.select_one(".tanggal")
+        if tanggal:
+            card["date_text"] = normalize_space(tanggal.get_text(" "))
+
+        # Extract penyelenggara
+        penyelenggara = container.select_one(".penyelenggara span:not(.subtitle)")
+        if penyelenggara:
+            card["penyelenggara"] = normalize_space(penyelenggara.get_text())
+
+        # Extract target (peserta)
+        target = container.select_one(".target")
+        if target:
+            card["target"] = normalize_space(target.get_text(" "))
+
+        cards.append(card)
+
+    # Also parse from "most wanted" swiper section (different structure)
+    for slide in soup.select(".event-most-container"):
+        title_link = slide.select_one("h4.event-title a")
+        if not title_link:
+            continue
+
+        href = title_link.get("href", "")
+        if not href or not href.startswith("info-"):
+            continue
+        link = urljoin(base_url, href)
+        if link in seen_links:
+            continue
+        seen_links.add(link)
+
+        card = {"link": link, "title": normalize_space(title_link.get_text(" "))}
+
+        img = slide.select_one(".img-container img")
+        if img:
+            src = img.get("src") or img.get("data-src") or ""
+            poster_url = clean_url(src, base_url)
+            if poster_url and "images/event/poster/" in poster_url:
+                card["poster"] = poster_url
+
+        cards.append(card)
+
+    return cards
+
 
 def scrape_infolomba(seen_ids: set) -> list:
     print("[infolomba] Starting...")
@@ -1020,50 +1114,85 @@ def scrape_infolomba(seen_ids: set) -> list:
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        unique_links = {
-            urljoin(base_url, a["href"]): a
-            for a in soup.find_all("a", href=lambda h: h and "info-" in h)
-            if urljoin(base_url, a.get("href", "")).startswith(base_url + "/")
-        }
+        # Parse cards from the listing page directly
+        cards = _parse_infolomba_cards(soup, base_url)
+        print(f"[infolomba] Found {len(cards)} cards on listing page")
 
-        for link, anchor in list(unique_links.items())[:MAX_WEB_ITEMS]:
+        for card in cards[:MAX_WEB_ITEMS]:
+            link = card["link"]
+            title = clean_title(card.get("title", ""))
+            uid = make_id(title, "infolomba.id")
+            if uid in seen_ids:
+                continue
+
             try:
                 res = scraper.get(link, headers=HEADERS, timeout=30)
                 if res.status_code != 200:
+                    print(f"[infolomba] Skip {link}: HTTP {res.status_code}")
                     continue
 
                 dsoup = BeautifulSoup(res.text, "html.parser")
                 full_text = dsoup.get_text("\n")
                 if not is_mahasiswa(full_text):
+                    print(f"[infolomba] Skip {title}: not mahasiswa")
                     continue
 
-                title_tag = dsoup.find(["h1", "h2"])
-                slug_title = (
-                    "-".join(link.rstrip("/").split("/")[-1].replace("info-", "", 1).split("-")[:-1])
-                    .replace("-", " ").title()
-                )
-                title = clean_title(title_tag.get_text(" ") if title_tag else slug_title)
-                uid = make_id(title, "infolomba.id")
-                if uid in seen_ids:
-                    continue
+                # Get better title from detail page
+                title_tag = dsoup.select_one("h4.event-title, h3.event-title, h1, h2")
+                if title_tag:
+                    detail_title = clean_title(title_tag.get_text(" "))
+                    if detail_title != "Tanpa Judul":
+                        title = detail_title
 
-                if "Daftar Sekarang" in full_text and "Laporkan Lomba" in full_text:
+                # Extract caption from event-description-container
+                desc_container = dsoup.select_one(".event-description-container")
+                if desc_container:
+                    caption = "\n".join(l.strip() for l in desc_container.get_text("\n").splitlines() if l.strip())
+                elif "Daftar Sekarang" in full_text and "Laporkan Lomba" in full_text:
                     body = full_text.split("Daftar Sekarang")[-1].split("Laporkan Lomba")[0]
                     caption = "\n".join(l.strip() for l in body.splitlines() if l.strip())
                 else:
                     caption = "\n".join(l.strip() for l in full_text.splitlines() if l.strip())[:2500]
 
-                poster = best_poster_from_soup(dsoup, base_url)
+                # Get poster: prefer card poster > detail page poster
+                poster = card.get("poster", "")
                 if not poster:
-                    img = anchor.find("img") or {}
-                    poster = clean_url(img.get("src") or img.get("data-src") or "", base_url)
+                    poster = best_poster_from_soup(dsoup, base_url, source="infolomba.id")
 
-                results.append(_build_item(
+                # Get penyelenggara from card or detail page
+                penyelenggara = card.get("penyelenggara", "")
+                if not penyelenggara:
+                    penyelenggara_el = dsoup.select_one(".profile-event-details-container h5.name")
+                    if penyelenggara_el:
+                        penyelenggara = normalize_space(penyelenggara_el.get_text())
+
+                # Get deadline from card date or caption
+                deadline = ""
+                date_text = card.get("date_text", "")
+                if date_text:
+                    deadline = extract_timeline(date_text)
+                if not deadline:
+                    # Try from detail page tanggal section
+                    tanggal_div = dsoup.select_one(".event-details-container .tanggal")
+                    if tanggal_div:
+                        deadline = extract_timeline(tanggal_div.get_text(" "))
+                if not deadline:
+                    deadline = extract_timeline(caption)
+
+                item = _build_item(
                     uid, "infolomba.id", title, poster, caption,
                     extract_registration_links(full_text, anchor_rows(dsoup, base_url)),
                     link,
-                ))
+                )
+                # Override deadline and penyelenggara with better extracted values
+                if deadline:
+                    item["deadline"] = deadline
+                if penyelenggara:
+                    item["penyelenggara"] = penyelenggara
+
+                results.append(item)
                 seen_ids.add(uid)
+                print(f"[infolomba] ✓ {title}")
 
             except Exception as exc:
                 print(f"[infolomba] Skip {link}: {exc}")
@@ -1076,7 +1205,7 @@ def scrape_infolomba(seen_ids: set) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Scraper: silomba.id
+# Scraper: silomba.id  (REWRITTEN)
 # ---------------------------------------------------------------------------
 
 async def scrape_silomba(seen_ids: set) -> list:
@@ -1088,22 +1217,82 @@ async def scrape_silomba(seen_ids: set) -> list:
         browser = await p.chromium.launch(headless=True)
         try:
             page = await browser.new_page(user_agent=HEADERS["User-Agent"])
-            await page.goto(base_url, wait_until="networkidle", timeout=45000)
-            await page.wait_for_selector("#competition-section", timeout=15000)
+
+            # Navigate to the page
+            await page.goto(base_url, wait_until="domcontentloaded", timeout=60000)
+
+            # Wait for the competition section to appear
+            try:
+                await page.wait_for_selector("#competition-section", timeout=15000)
+            except Exception:
+                print("[silomba] competition-section not found, trying alternative selectors")
+
+            # Scroll down to trigger lazy loading and wait for competitions to load
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+            await page.wait_for_timeout(3000)
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(3000)
+
+            # Wait for competition cards to appear (multiple selector strategies)
+            card_selectors = [
+                'a[href*="/lomba/"]',
+                '#competition-section a',
+                '[data-analytics-section="competition"] a',
+            ]
+
+            cards_found = False
+            for selector in card_selectors:
+                try:
+                    await page.wait_for_selector(selector, timeout=10000)
+                    cards_found = True
+                    print(f"[silomba] Found cards with selector: {selector}")
+                    break
+                except Exception:
+                    continue
+
+            if not cards_found:
+                print("[silomba] No competition cards found after waiting")
+                # Try one more scroll + wait cycle
+                for _ in range(3):
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await page.wait_for_timeout(2000)
+
             soup = BeautifulSoup(await page.content(), "html.parser")
             await page.close()
 
-            section = soup.find(id="competition-section")
-            if not section:
-                return results
+            # Find competition links — try multiple strategies
+            competition_links = []
+            seen_hrefs = set()
 
-            for card in section.find_all("a", href=lambda h: h and h.startswith("/lomba/"))[:MAX_WEB_ITEMS]:
+            # Strategy 1: Links with /lomba/ path
+            for a_tag in soup.find_all("a", href=lambda h: h and "/lomba/" in h):
+                href = a_tag.get("href", "")
+                full_url = urljoin(base_url, href)
+                if full_url not in seen_hrefs:
+                    seen_hrefs.add(full_url)
+                    competition_links.append((full_url, a_tag))
+
+            # Strategy 2: If no /lomba/ links, look for cards in competition section
+            if not competition_links:
+                section = soup.find(id="competition-section")
+                if section:
+                    for a_tag in section.find_all("a", href=True):
+                        href = a_tag.get("href", "")
+                        if href.startswith("#") or href.startswith("javascript"):
+                            continue
+                        full_url = urljoin(base_url, href)
+                        if full_url not in seen_hrefs and full_url != base_url:
+                            seen_hrefs.add(full_url)
+                            competition_links.append((full_url, a_tag))
+
+            print(f"[silomba] Found {len(competition_links)} competition links")
+
+            for link_url, card_tag in competition_links[:MAX_WEB_ITEMS]:
+                # Extract title from card
                 raw_title = (
-                    card.get("aria-label", "").replace("Lihat detail kompetisi ", "").strip()
+                    card_tag.get("aria-label", "").replace("Lihat detail kompetisi ", "").strip()
                     or (
-                        (h := card.find(["h1", "h2", "h3", "h4"])) and h.get_text(" ").strip()
+                        (h := card_tag.find(["h1", "h2", "h3", "h4"])) and h.get_text(" ").strip()
                     )
                     or "Tanpa Judul"
                 )
@@ -1112,13 +1301,21 @@ async def scrape_silomba(seen_ids: set) -> list:
                 if uid in seen_ids:
                     continue
 
-                link_detail = urljoin(base_url, card["href"])
-                poster = caption = ""
+                # Extract poster from card
+                card_poster = ""
+                card_img = card_tag.find("img")
+                if card_img:
+                    src = card_img.get("src") or card_img.get("data-src") or ""
+                    card_poster = clean_url(src, base_url)
+
+                poster = card_poster
+                caption = ""
                 links = []
 
                 try:
                     dp = await browser.new_page(user_agent=HEADERS["User-Agent"])
-                    await dp.goto(link_detail, wait_until="networkidle", timeout=45000)
+                    await dp.goto(link_url, wait_until="domcontentloaded", timeout=45000)
+                    await dp.wait_for_timeout(3000)  # Wait for content to render
                     dsoup = BeautifulSoup(await dp.content(), "html.parser")
                     await dp.close()
 
@@ -1126,19 +1323,34 @@ async def scrape_silomba(seen_ids: set) -> list:
                     if not is_mahasiswa(full_text):
                         continue
 
-                    poster = best_poster_from_soup(dsoup, base_url)
-                    caption = (
-                        full_text.split("Deskripsi Lomba")[-1].strip()
-                        if "Deskripsi Lomba" in full_text
-                        else "\n".join(l.strip() for l in full_text.splitlines() if l.strip())[:2500]
-                    )
+                    # Get poster from detail page if not from card
+                    if not poster or not _is_poster_url(poster):
+                        poster = best_poster_from_soup(dsoup, base_url, source="silomba.id")
+
+                    # Extract caption
+                    if "Deskripsi Lomba" in full_text:
+                        caption = full_text.split("Deskripsi Lomba")[-1].strip()
+                    else:
+                        caption = "\n".join(
+                            l.strip() for l in full_text.splitlines() if l.strip()
+                        )[:2500]
+
                     links = extract_registration_links(full_text, anchor_rows(dsoup, base_url))
 
-                except Exception as exc:
-                    print(f"[silomba] Detail failed {link_detail}: {exc}")
+                    # Better title from detail page
+                    detail_title_el = dsoup.find(["h1", "h2"])
+                    if detail_title_el:
+                        detail_title = clean_title(detail_title_el.get_text(" "))
+                        if detail_title != "Tanpa Judul" and len(detail_title) > len(title):
+                            title = detail_title
 
-                results.append(_build_item(uid, "silomba.id", title, poster, caption, links, link_detail))
+                except Exception as exc:
+                    print(f"[silomba] Detail failed {link_url}: {exc}")
+
+                item = _build_item(uid, "silomba.id", title, poster, caption, links, link_url)
+                results.append(item)
                 seen_ids.add(uid)
+                print(f"[silomba] ✓ {title}")
 
         except Exception as exc:
             print(f"[silomba] Error: {exc}")
@@ -1155,7 +1367,7 @@ async def scrape_silomba(seen_ids: set) -> list:
 
 def _normalize_ig_caption(raw: str) -> str:
     caption = re.sub(r"^\s*[^:\n]{1,80}\s+on Instagram:\s*", "", (raw or "").strip(), flags=re.I)
-    return re.sub(r'^\s*"|\"\s*$', "", caption).strip()
+    return re.sub(r'^\s*"|\"\\s*$', "", caption).strip()
 
 
 def _ig_shortcode(url: str) -> str:
