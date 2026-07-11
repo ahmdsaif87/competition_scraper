@@ -19,9 +19,6 @@ from pymongo import UpdateOne
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
 
 
 # ---------------------------------------------------------------------------
@@ -35,7 +32,7 @@ DB_NAME = os.environ.get("DB_NAME", "competition_scraper")
 COLLECTION = os.environ.get("COLLECTION", "competition")
 IG_ACCOUNTS = [
     a.strip()
-    for a in os.environ.get("IG_ACCOUNTS", "infolomba,infolomba_gratis,infolomba.olimpiade").split(",")
+    for a in os.environ.get("IG_ACCOUNTS", "infolomba,infolomba_gratis,infolomba.olimpiade,lombamahasiswa,lombakampus_id,lombasains,lombabisnis,lombazone,lombakompetisi,eventmahasiswa,lombamahasiswa_id,lombanasional,infolombaindonesia").split(",")
     if a.strip()
 ]
 MAX_WEB_ITEMS = int(os.environ.get("MAX_WEB_ITEMS", "15"))
@@ -1009,98 +1006,100 @@ def _build_item(uid, source, title, poster, caption, links, direct_url) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Scraper: infolomba.id  (REWRITTEN)
+# Scraper: infolomba.id
 # ---------------------------------------------------------------------------
 
-def _parse_infolomba_cards(soup: BeautifulSoup, base_url: str) -> list[dict]:
-    """
-    Parse competition cards from infolomba.id listing page.
-    
-    The page structure has two sections:
-    - .most-wanted (swiper): featured competitions
-    - .event-list (#eventsContainer): regular listing
-    
-    Each card has:
-    - a[href="info-..."] link to detail page
-    - img[src="images/event/poster/..."] poster image
-    - h4.event-title > a: title
-    - .tanggal: date info
-    - .penyelenggara span: organizer
-    """
-    cards = []
-    seen_links = set()
+def _infolomba_card_from(container, base_url: str, seen: set) -> dict | None:
+    title_link = container.select_one("h4.event-title a")
+    if not title_link:
+        return None
 
-    # Parse from event listing containers
-    for container in soup.select(".event-container"):
-        card = {}
+    href = title_link.get("href", "")
+    if not href or not href.startswith("info-"):
+        return None
 
-        # Extract link and title
-        title_link = container.select_one("h4.event-title a")
-        if not title_link:
-            continue
+    link = urljoin(base_url, href)
+    if link in seen:
+        return None
+    seen.add(link)
 
-        href = title_link.get("href", "")
-        if not href or not href.startswith("info-"):
-            continue
-        link = urljoin(base_url, href)
-        if link in seen_links:
-            continue
-        seen_links.add(link)
+    card = {"link": link, "title": normalize_space(title_link.get_text(" "))}
 
-        card["link"] = link
-        card["title"] = normalize_space(title_link.get_text(" "))
+    img = container.select_one(".img-container img, a.img-container img")
+    if img:
+        src = img.get("src") or img.get("data-src") or ""
+        url = clean_url(src, base_url)
+        if url and "images/event/poster/" in url:
+            card["poster"] = url
 
-        # Extract poster from img-container
-        img_container = container.select_one("a.img-container img, .img-container img")
-        if img_container:
-            src = img_container.get("src") or img_container.get("data-src") or ""
-            poster_url = clean_url(src, base_url)
-            if poster_url and "images/event/poster/" in poster_url:
-                card["poster"] = poster_url
+    tgl = container.select_one(".tanggal")
+    if tgl:
+        card["date_text"] = normalize_space(tgl.get_text(" "))
 
-        # Extract date
-        tanggal = container.select_one(".tanggal")
-        if tanggal:
-            card["date_text"] = normalize_space(tanggal.get_text(" "))
+    org = container.select_one(".penyelenggara span:not(.subtitle)")
+    if org:
+        card["penyelenggara"] = normalize_space(org.get_text())
 
-        # Extract penyelenggara
-        penyelenggara = container.select_one(".penyelenggara span:not(.subtitle)")
-        if penyelenggara:
-            card["penyelenggara"] = normalize_space(penyelenggara.get_text())
+    return card
 
-        # Extract target (peserta)
-        target = container.select_one(".target")
-        if target:
-            card["target"] = normalize_space(target.get_text(" "))
 
-        cards.append(card)
+def _infolomba_detail(dsoup, card: dict, base_url: str):
+    """Extract richer data from a detail page."""
+    full_text = dsoup.get_text("\n")
+    if not is_mahasiswa(full_text):
+        return None
 
-    # Also parse from "most wanted" swiper section (different structure)
-    for slide in soup.select(".event-most-container"):
-        title_link = slide.select_one("h4.event-title a")
-        if not title_link:
-            continue
+    # Better title (prefer h4.event-title without "Most Wanted")
+    title = card["title"]
+    tag = dsoup.select_one("h4.event-title.mb-0") or dsoup.select_one("h4.event-title")
+    if tag:
+        t = clean_title(tag.get_text(" "))
+        if t and t != "Tanpa Judul" and "most wanted" not in t.lower():
+            title = t
 
-        href = title_link.get("href", "")
-        if not href or not href.startswith("info-"):
-            continue
-        link = urljoin(base_url, href)
-        if link in seen_links:
-            continue
-        seen_links.add(link)
+    # Caption
+    container = dsoup.select_one(".event-description-container")
+    if container:
+        caption = "\n".join(l for l in container.get_text("\n").splitlines() if l.strip())
+    elif "Daftar Sekarang" in full_text and "Laporkan Lomba" in full_text:
+        body = full_text.split("Daftar Sekarang")[-1].split("Laporkan Lomba")[0]
+        caption = "\n".join(l for l in body.splitlines() if l.strip())
+    else:
+        lines = [l.strip() for l in full_text.splitlines() if l.strip()]
+        caption = "\n".join(lines)[:2500]
 
-        card = {"link": link, "title": normalize_space(title_link.get_text(" "))}
+    # Poster
+    poster = card.get("poster", "") or best_poster_from_soup(dsoup, base_url, source="infolomba.id")
 
-        img = slide.select_one(".img-container img")
-        if img:
-            src = img.get("src") or img.get("data-src") or ""
-            poster_url = clean_url(src, base_url)
-            if poster_url and "images/event/poster/" in poster_url:
-                card["poster"] = poster_url
+    # Penyelenggara
+    penyelenggara = card.get("penyelenggara", "")
+    if not penyelenggara:
+        el = dsoup.select_one(".profile-event-details-container h5.name")
+        if el:
+            penyelenggara = normalize_space(el.get_text())
 
-        cards.append(card)
+    # Deadline
+    deadline = ""
+    if card.get("date_text"):
+        deadline = extract_timeline(card["date_text"])
+    if not deadline:
+        tgl = dsoup.select_one(".event-details-container .tanggal")
+        if tgl:
+            deadline = extract_timeline(tgl.get_text(" "))
+    if not deadline:
+        deadline = extract_timeline(caption)
 
-    return cards
+    item = _build_item(
+        make_id(card["title"], "infolomba.id"),
+        "infolomba.id", title, poster, caption,
+        extract_registration_links(full_text, anchor_rows(dsoup, base_url)),
+        card["link"],
+    )
+    if deadline:
+        item["deadline"] = deadline
+    if penyelenggara:
+        item["penyelenggara"] = penyelenggara
+    return item
 
 
 def scrape_infolomba(seen_ids: set) -> list:
@@ -1114,99 +1113,129 @@ def scrape_infolomba(seen_ids: set) -> list:
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # Parse cards from the listing page directly
-        cards = _parse_infolomba_cards(soup, base_url)
-        print(f"[infolomba] Found {len(cards)} cards on listing page")
+        seen_links = set()
+        cards = []
+
+        for sel in (".event-container", ".event-most-container"):
+            cards.extend(
+                c for el in soup.select(sel)
+                if (c := _infolomba_card_from(el, base_url, seen_links))
+            )
+
+        print(f"[infolomba] {len(cards)} cards")
 
         for card in cards[:MAX_WEB_ITEMS]:
-            link = card["link"]
-            title = clean_title(card.get("title", ""))
-            uid = make_id(title, "infolomba.id")
+            uid = make_id(card["title"], "infolomba.id")
             if uid in seen_ids:
                 continue
 
             try:
-                res = scraper.get(link, headers=HEADERS, timeout=30)
+                res = scraper.get(card["link"], headers=HEADERS, timeout=30)
                 if res.status_code != 200:
-                    print(f"[infolomba] Skip {link}: HTTP {res.status_code}")
                     continue
 
-                dsoup = BeautifulSoup(res.text, "html.parser")
-                full_text = dsoup.get_text("\n")
-                if not is_mahasiswa(full_text):
-                    print(f"[infolomba] Skip {title}: not mahasiswa")
-                    continue
+                item = _infolomba_detail(BeautifulSoup(res.text, "html.parser"), card, base_url)
+                if item:
+                    results.append(item)
+                    seen_ids.add(uid)
+                    print(f"[infolomba] ✓ {item['judul'][:50]}")
+            except Exception as e:
+                print(f"[infolomba] {card['link']}: {e}")
 
-                # Get better title from detail page
-                title_tag = dsoup.select_one("h4.event-title, h3.event-title, h1, h2")
-                if title_tag:
-                    detail_title = clean_title(title_tag.get_text(" "))
-                    if detail_title != "Tanpa Judul":
-                        title = detail_title
+    except Exception as e:
+        print(f"[infolomba] Error: {e}")
 
-                # Extract caption from event-description-container
-                desc_container = dsoup.select_one(".event-description-container")
-                if desc_container:
-                    caption = "\n".join(l.strip() for l in desc_container.get_text("\n").splitlines() if l.strip())
-                elif "Daftar Sekarang" in full_text and "Laporkan Lomba" in full_text:
-                    body = full_text.split("Daftar Sekarang")[-1].split("Laporkan Lomba")[0]
-                    caption = "\n".join(l.strip() for l in body.splitlines() if l.strip())
-                else:
-                    caption = "\n".join(l.strip() for l in full_text.splitlines() if l.strip())[:2500]
-
-                # Get poster: prefer card poster > detail page poster
-                poster = card.get("poster", "")
-                if not poster:
-                    poster = best_poster_from_soup(dsoup, base_url, source="infolomba.id")
-
-                # Get penyelenggara from card or detail page
-                penyelenggara = card.get("penyelenggara", "")
-                if not penyelenggara:
-                    penyelenggara_el = dsoup.select_one(".profile-event-details-container h5.name")
-                    if penyelenggara_el:
-                        penyelenggara = normalize_space(penyelenggara_el.get_text())
-
-                # Get deadline from card date or caption
-                deadline = ""
-                date_text = card.get("date_text", "")
-                if date_text:
-                    deadline = extract_timeline(date_text)
-                if not deadline:
-                    # Try from detail page tanggal section
-                    tanggal_div = dsoup.select_one(".event-details-container .tanggal")
-                    if tanggal_div:
-                        deadline = extract_timeline(tanggal_div.get_text(" "))
-                if not deadline:
-                    deadline = extract_timeline(caption)
-
-                item = _build_item(
-                    uid, "infolomba.id", title, poster, caption,
-                    extract_registration_links(full_text, anchor_rows(dsoup, base_url)),
-                    link,
-                )
-                # Override deadline and penyelenggara with better extracted values
-                if deadline:
-                    item["deadline"] = deadline
-                if penyelenggara:
-                    item["penyelenggara"] = penyelenggara
-
-                results.append(item)
-                seen_ids.add(uid)
-                print(f"[infolomba] ✓ {title}")
-
-            except Exception as exc:
-                print(f"[infolomba] Skip {link}: {exc}")
-
-    except Exception as exc:
-        print(f"[infolomba] Error: {exc}")
-
-    print(f"[infolomba] Done: {len(results)} items")
+    print(f"[infolomba] Done: {len(results)}")
     return results
 
 
 # ---------------------------------------------------------------------------
-# Scraper: silomba.id  (REWRITTEN)
+# Scraper: silomba.id
 # ---------------------------------------------------------------------------
+
+async def _silomba_listing(browser) -> list[tuple[str, str, str]]:
+    """Return [(url, title, poster)] from the listing page."""
+    base_url = "https://silomba.id"
+    page = await browser.new_page(user_agent=HEADERS["User-Agent"])
+    items = []
+
+    try:
+        await page.goto(base_url, wait_until="domcontentloaded", timeout=60000)
+        try:
+            await page.wait_for_selector("#competition-section", timeout=15000)
+        except Exception:
+            pass
+
+        # Scroll to trigger lazy load
+        for _ in range(3):
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(2000)
+
+        soup = BeautifulSoup(await page.content(), "html.parser")
+        seen = set()
+
+        for a in soup.find_all("a", href=lambda h: h and "/lomba/" in h):
+            href = a.get("href", "")
+            url = urljoin(base_url, href)
+            if url in seen:
+                continue
+            seen.add(url)
+
+            title = (
+                a.get("aria-label", "").replace("Lihat detail kompetisi ", "").strip()
+                or (a.find(["h1", "h2", "h3", "h4"]).get_text(" ").strip() if a.find(["h1", "h2", "h3", "h4"]) else "")
+                or "Tanpa Judul"
+            )
+            img = a.find("img")
+            poster = clean_url(img.get("src") or img.get("data-src") or "", base_url) if img else ""
+            items.append((url, title, poster))
+
+    finally:
+        await page.close()
+
+    return items
+
+
+async def _silomba_detail(browser, url: str, title: str, poster: str, base_url: str):
+    """Return a built item or None."""
+    page = await browser.new_page(user_agent=HEADERS["User-Agent"])
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        await page.wait_for_timeout(3000)
+        soup = BeautifulSoup(await page.content(), "html.parser")
+        full_text = soup.get_text("\n")
+
+        if not is_mahasiswa(full_text):
+            return None
+
+        if not poster or not _is_poster_url(poster):
+            poster = best_poster_from_soup(soup, base_url, source="silomba.id")
+
+        if "Deskripsi Lomba" in full_text:
+            caption = full_text.split("Deskripsi Lomba")[-1].strip()
+            # Trim footer disclaimer
+            for marker in ("Silomba hanya media", "Untuk info lebih lanjut", "Ikuti Kami", "Bagikan"):
+                if marker in caption:
+                    caption = caption.split(marker)[0].strip()
+        else:
+            lines = [l.strip() for l in full_text.splitlines() if l.strip()]
+            caption = "\n".join(lines)[:2500]
+
+        links = extract_registration_links(full_text, anchor_rows(soup, base_url))
+
+        el = soup.find(["h1", "h2"])
+        if el:
+            t = clean_title(el.get_text(" "))
+            if t != "Tanpa Judul" and len(t) > len(title):
+                title = t
+
+        return _build_item(
+            make_id(title, "silomba.id"),
+            "silomba.id", title, poster, caption, links, url,
+        )
+    finally:
+        await page.close()
+
 
 async def scrape_silomba(seen_ids: set) -> list:
     print("[silomba] Starting...")
@@ -1216,148 +1245,29 @@ async def scrape_silomba(seen_ids: set) -> list:
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         try:
-            page = await browser.new_page(user_agent=HEADERS["User-Agent"])
+            items = await _silomba_listing(browser)
+            print(f"[silomba] {len(items)} links")
 
-            # Navigate to the page
-            await page.goto(base_url, wait_until="domcontentloaded", timeout=60000)
-
-            # Wait for the competition section to appear
-            try:
-                await page.wait_for_selector("#competition-section", timeout=15000)
-            except Exception:
-                print("[silomba] competition-section not found, trying alternative selectors")
-
-            # Scroll down to trigger lazy loading and wait for competitions to load
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-            await page.wait_for_timeout(3000)
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await page.wait_for_timeout(3000)
-
-            # Wait for competition cards to appear (multiple selector strategies)
-            card_selectors = [
-                'a[href*="/lomba/"]',
-                '#competition-section a',
-                '[data-analytics-section="competition"] a',
-            ]
-
-            cards_found = False
-            for selector in card_selectors:
-                try:
-                    await page.wait_for_selector(selector, timeout=10000)
-                    cards_found = True
-                    print(f"[silomba] Found cards with selector: {selector}")
-                    break
-                except Exception:
-                    continue
-
-            if not cards_found:
-                print("[silomba] No competition cards found after waiting")
-                # Try one more scroll + wait cycle
-                for _ in range(3):
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await page.wait_for_timeout(2000)
-
-            soup = BeautifulSoup(await page.content(), "html.parser")
-            await page.close()
-
-            # Find competition links — try multiple strategies
-            competition_links = []
-            seen_hrefs = set()
-
-            # Strategy 1: Links with /lomba/ path
-            for a_tag in soup.find_all("a", href=lambda h: h and "/lomba/" in h):
-                href = a_tag.get("href", "")
-                full_url = urljoin(base_url, href)
-                if full_url not in seen_hrefs:
-                    seen_hrefs.add(full_url)
-                    competition_links.append((full_url, a_tag))
-
-            # Strategy 2: If no /lomba/ links, look for cards in competition section
-            if not competition_links:
-                section = soup.find(id="competition-section")
-                if section:
-                    for a_tag in section.find_all("a", href=True):
-                        href = a_tag.get("href", "")
-                        if href.startswith("#") or href.startswith("javascript"):
-                            continue
-                        full_url = urljoin(base_url, href)
-                        if full_url not in seen_hrefs and full_url != base_url:
-                            seen_hrefs.add(full_url)
-                            competition_links.append((full_url, a_tag))
-
-            print(f"[silomba] Found {len(competition_links)} competition links")
-
-            for link_url, card_tag in competition_links[:MAX_WEB_ITEMS]:
-                # Extract title from card
-                raw_title = (
-                    card_tag.get("aria-label", "").replace("Lihat detail kompetisi ", "").strip()
-                    or (
-                        (h := card_tag.find(["h1", "h2", "h3", "h4"])) and h.get_text(" ").strip()
-                    )
-                    or "Tanpa Judul"
-                )
-                title = clean_title(raw_title)
+            for url, title, poster in items[:MAX_WEB_ITEMS]:
                 uid = make_id(title, "silomba.id")
                 if uid in seen_ids:
                     continue
 
-                # Extract poster from card
-                card_poster = ""
-                card_img = card_tag.find("img")
-                if card_img:
-                    src = card_img.get("src") or card_img.get("data-src") or ""
-                    card_poster = clean_url(src, base_url)
-
-                poster = card_poster
-                caption = ""
-                links = []
-
                 try:
-                    dp = await browser.new_page(user_agent=HEADERS["User-Agent"])
-                    await dp.goto(link_url, wait_until="domcontentloaded", timeout=45000)
-                    await dp.wait_for_timeout(3000)  # Wait for content to render
-                    dsoup = BeautifulSoup(await dp.content(), "html.parser")
-                    await dp.close()
+                    item = await _silomba_detail(browser, url, title, poster, base_url)
+                    if item:
+                        results.append(item)
+                        seen_ids.add(uid)
+                        print(f"[silomba] ✓ {item['judul'][:50]}")
+                except Exception as e:
+                    print(f"[silomba] {url}: {e}")
 
-                    full_text = dsoup.get_text("\n")
-                    if not is_mahasiswa(full_text):
-                        continue
-
-                    # Get poster from detail page if not from card
-                    if not poster or not _is_poster_url(poster):
-                        poster = best_poster_from_soup(dsoup, base_url, source="silomba.id")
-
-                    # Extract caption
-                    if "Deskripsi Lomba" in full_text:
-                        caption = full_text.split("Deskripsi Lomba")[-1].strip()
-                    else:
-                        caption = "\n".join(
-                            l.strip() for l in full_text.splitlines() if l.strip()
-                        )[:2500]
-
-                    links = extract_registration_links(full_text, anchor_rows(dsoup, base_url))
-
-                    # Better title from detail page
-                    detail_title_el = dsoup.find(["h1", "h2"])
-                    if detail_title_el:
-                        detail_title = clean_title(detail_title_el.get_text(" "))
-                        if detail_title != "Tanpa Judul" and len(detail_title) > len(title):
-                            title = detail_title
-
-                except Exception as exc:
-                    print(f"[silomba] Detail failed {link_url}: {exc}")
-
-                item = _build_item(uid, "silomba.id", title, poster, caption, links, link_url)
-                results.append(item)
-                seen_ids.add(uid)
-                print(f"[silomba] ✓ {title}")
-
-        except Exception as exc:
-            print(f"[silomba] Error: {exc}")
+        except Exception as e:
+            print(f"[silomba] Error: {e}")
         finally:
             await browser.close()
 
-    print(f"[silomba] Done: {len(results)} items")
+    print(f"[silomba] Done: {len(results)}")
     return results
 
 
@@ -1365,9 +1275,18 @@ async def scrape_silomba(seen_ids: set) -> list:
 # Scraper: Instagram
 # ---------------------------------------------------------------------------
 
+import html as _html
+
+
 def _normalize_ig_caption(raw: str) -> str:
-    caption = re.sub(r"^\s*[^:\n]{1,80}\s+on Instagram:\s*", "", (raw or "").strip(), flags=re.I)
-    return re.sub(r'^\s*"|\"\\s*$', "", caption).strip()
+    caption = _html.unescape(raw.strip())
+    # Strip prefix: "N likes, M comments - username on Date: \"CAPTION\"."
+    m = re.search(r':\s*"(.*)"\s*\.?\s*$', caption, re.DOTALL)
+    if m:
+        caption = m.group(1)
+    else:
+        caption = re.sub(r"^\s*[^:\n]{1,80}\s+on Instagram:\s*", "", caption, flags=re.I)
+    return re.sub(r'\s*$', "", caption).strip()
 
 
 def _ig_shortcode(url: str) -> str:
@@ -1377,67 +1296,73 @@ def _ig_shortcode(url: str) -> str:
 
 def _build_chrome_driver() -> webdriver.Chrome:
     opts = Options()
-    for arg in ("--headless=new", "--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage",
-                 f"user-agent={HEADERS['User-Agent']}"):
-        opts.add_argument(arg)
+    opts.add_argument("--headless=new")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-software-rasterizer")
+    opts.add_argument("--disable-extensions")
+    opts.add_argument("--blink-settings=imagesEnabled=false")
+    opts.add_argument(f"user-agent={HEADERS['User-Agent']}")
     if os.path.exists("/opt/chrome/chrome"):
         opts.binary_location = "/opt/chrome/chrome"
     service = Service("/usr/bin/chromedriver") if os.path.exists("/usr/bin/chromedriver") else Service()
     return webdriver.Chrome(service=service, options=opts)
 
 
-_IG_POSTER_JS = """
-const imgs = Array.from(document.querySelectorAll('article img'));
-for (const img of imgs) {
-  const src = img.currentSrc || img.src || '';
-  const alt = (img.alt || '').toLowerCase();
-  if (!src || alt.includes('profile') || src.includes('150x150')) continue;
-  if (src.includes('scontent') || src.includes('cdninstagram')) return src;
-}
-return '';
-"""
-
-
-def _collect_post_urls(driver, account: str) -> list[str]:
+def _collect_profile_posts(driver, account: str) -> list[dict]:
     driver.get(f"https://www.instagram.com/{account}/")
-    time.sleep(random.randint(4, 6))
+    time.sleep(2.5)
     if "page not found" in driver.title.lower():
         return []
 
-    seen, urls = set(), []
     last_height = driver.execute_script("return document.body.scrollHeight")
-    for _ in range(3):
+    for _ in range(2):
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(random.randint(2, 4))
-        for el in driver.find_elements(By.XPATH, '//a[contains(@href,"/p/") or contains(@href,"/reel/")]'):
-            href = el.get_attribute("href")
-            if href and href not in seen:
-                seen.add(href)
-                urls.append(href)
+        time.sleep(1.5)
         new_height = driver.execute_script("return document.body.scrollHeight")
         if new_height == last_height:
             break
         last_height = new_height
-    return urls
+
+    return driver.execute_script("""
+        var links = document.querySelectorAll('a[href*="/p/"]');
+        var result = [];
+        var seen = new Set();
+        for (var i = 0; i < links.length; i++) {
+            var href = links[i].href;
+            if (!seen.has(href) && href) {
+                seen.add(href);
+                result.push({url: href});
+            }
+        }
+        return result;
+    """)
 
 
-def _scrape_ig_post(driver, url: str, account: str, seen_ids: set) -> dict | None:
-    driver.get(url)
-    try:
-        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "article")))
-    except Exception:
-        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "img")))
-    time.sleep(random.randint(3, 5))
+def _fetch_ig_post_data(driver, url: str, account: str, seen_ids: set) -> dict | None:
+    data = driver.execute_script("""
+        return fetch(arguments[0])
+            .then(function(r) { return r.text(); })
+            .then(function(html) {
+                var desc = html.match(
+                    /<meta[^>]*property="og:description"[^>]*content="([^"]*)"/
+                );
+                var img = html.match(
+                    /<meta[^>]*property="og:image"[^>]*content="([^"]*)"/
+                );
+                return {
+                    caption: desc ? desc[1] : null,
+                    image: img ? img[1] : null
+                };
+            })
+            .catch(function() { return null; });
+    """, url)
 
-    caption = ""
-    if h1s := driver.find_elements(By.XPATH, "//article//h1"):
-        caption = h1s[0].text
-    if not caption:
-        if metas := driver.find_elements(By.XPATH, '//meta[@property="og:description"]'):
-            raw = metas[0].get_attribute("content") or ""
-            caption = raw.split(": ", 1)[1] if ": " in raw else raw
+    if not data or not data.get("caption"):
+        return None
 
-    caption = _normalize_ig_caption(caption or driver.title)
+    caption = _normalize_ig_caption(data["caption"])
     if not caption or not is_mahasiswa(caption):
         return None
 
@@ -1445,19 +1370,48 @@ def _scrape_ig_post(driver, url: str, account: str, seen_ids: set) -> dict | Non
     if uid in seen_ids:
         return None
 
-    poster = driver.execute_script(_IG_POSTER_JS)
-    if not poster:
-        if og := driver.find_elements(By.XPATH, '//meta[@property="og:image"]'):
-            poster = og[0].get_attribute("content") or ""
-
     title = extract_title_from_caption(caption)
     return _build_item(
         uid, f"IG @{account}",
         title,
-        poster, caption,
+        data.get("image", ""),
+        caption,
         extract_registration_links(caption),
         url,
     )
+
+
+def _process_accounts_batch(accounts: list[str], seen_ids: set) -> list:
+    results = []
+    driver = _build_chrome_driver()
+
+    try:
+        driver.get("https://www.instagram.com/")
+        time.sleep(2.5)
+        driver.add_cookie({"name": "sessionid", "value": IG_SESSION_ID, "domain": ".instagram.com"})
+        driver.refresh()
+        time.sleep(3.5)
+        if "login" in driver.current_url.lower():
+            print("[IG] Invalid session.")
+            return []
+
+        for account in accounts:
+            posts = _collect_profile_posts(driver, account)
+            for p in posts[:MAX_IG_POSTS_PER_ACCOUNT]:
+                try:
+                    item = _fetch_ig_post_data(driver, p["url"], account, seen_ids)
+                    if item:
+                        results.append(item)
+                        seen_ids.add(item["id"])
+                except Exception as exc:
+                    print(f"[IG] Skip post {p['url']}: {exc}")
+
+    except Exception as exc:
+        print(f"[IG] Error: {exc}")
+    finally:
+        driver.quit()
+
+    return results
 
 
 def scrape_instagram(seen_ids: set) -> list:
@@ -1467,33 +1421,12 @@ def scrape_instagram(seen_ids: set) -> list:
 
     print("[IG] Starting...")
     results = []
-    driver = _build_chrome_driver()
+    batch_size = 5
 
-    try:
-        driver.get("https://www.instagram.com/")
-        time.sleep(3)
-        driver.add_cookie({"name": "sessionid", "value": IG_SESSION_ID, "domain": ".instagram.com"})
-        driver.refresh()
-        time.sleep(5)
-        if "login" in driver.current_url.lower():
-            print("[IG] Invalid session.")
-            return []
-
-        for account in IG_ACCOUNTS:
-            post_urls = _collect_post_urls(driver, account)
-            for url in post_urls[:MAX_IG_POSTS_PER_ACCOUNT]:
-                try:
-                    item = _scrape_ig_post(driver, url, account, seen_ids)
-                    if item:
-                        results.append(item)
-                        seen_ids.add(item["id"])
-                except Exception as exc:
-                    print(f"[IG] Skip post {url}: {exc}")
-
-    except Exception as exc:
-        print(f"[IG] Error: {exc}")
-    finally:
-        driver.quit()
+    for i in range(0, len(IG_ACCOUNTS), batch_size):
+        batch = IG_ACCOUNTS[i:i + batch_size]
+        print(f"[IG] Batch {i // batch_size + 1}/{(len(IG_ACCOUNTS) + batch_size - 1) // batch_size}: {', '.join(batch)}")
+        results.extend(_process_accounts_batch(batch, seen_ids))
 
     print(f"[IG] Done: {len(results)} items")
     return results

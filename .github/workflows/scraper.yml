@@ -23,8 +23,26 @@ jobs:
         run: |
           pip install -r requirements.txt
 
+      - name: Install Chrome for Selenium
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq google-chrome-stable
+
       - name: Install Playwright browsers
         run: playwright install chromium && playwright install-deps
+
+      - name: Make headless shell symlink (Playwright compat)
+        run: |
+          PW_DIR=$(ls -d ~/.cache/ms-playwright/chromium_headless_shell-* 2>/dev/null || true)
+          if [ -z "$PW_DIR" ]; then
+            CHROMIUM_DIR=$(ls -d ~/.cache/ms-playwright/chromium-* 2>/dev/null | head -1)
+            if [ -n "$CHROMIUM_DIR" ]; then
+              VERSION=$(basename "$CHROMIUM_DIR" | sed 's/chromium-//')
+              mkdir -p ~/.cache/ms-playwright/chromium_headless_shell-$VERSION/chrome-headless-shell-linux64
+              ln -sf "$CHROMIUM_DIR/chrome-linux64/chrome" \
+                ~/.cache/ms-playwright/chromium_headless_shell-$VERSION/chrome-headless-shell-linux64/chrome-headless-shell
+            fi
+          fi
         
       - name: Run scraper to MongoDB
         env:
