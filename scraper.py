@@ -10,6 +10,7 @@ import time
 import unicodedata
 from urllib.parse import urljoin, urlparse
 
+import html as _html
 import cloudinary
 import cloudinary.uploader
 import cloudscraper
@@ -69,7 +70,8 @@ def upload_poster(image_url: str, public_id: str) -> str:
     if not image_url or not _cloudinary_configured:
         return image_url
     try:
-        r = requests.get(image_url, timeout=15, headers=HEADERS)
+        url = _html.unescape(image_url)
+        r = requests.get(url, timeout=15, headers=HEADERS)
         r.raise_for_status()
         result = cloudinary.uploader.upload(
             r.content,
@@ -1312,8 +1314,6 @@ async def scrape_silomba(seen_ids: set) -> list:
 # Scraper: Instagram
 # ---------------------------------------------------------------------------
 
-import html as _html
-
 
 def _normalize_ig_caption(raw: str) -> str:
     caption = _html.unescape(raw.strip())
@@ -1390,7 +1390,7 @@ def _fetch_ig_post_data(driver, url: str, account: str, seen_ids: set) -> dict |
                 );
                 return {
                     caption: desc ? desc[1] : null,
-                    image: img ? img[1] : null
+                    image: img ? img[1].replace(/&amp;/g, '&') : null
                 };
             })
             .catch(function() { return null; });
