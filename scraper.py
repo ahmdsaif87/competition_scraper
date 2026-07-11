@@ -10,6 +10,8 @@ import time
 import unicodedata
 from urllib.parse import urljoin, urlparse
 
+import cloudinary
+import cloudinary.uploader
 import cloudscraper
 import pymongo
 import requests
@@ -44,6 +46,41 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
     )
 }
+
+CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME", "")
+CLOUDINARY_API_KEY = os.environ.get("CLOUDINARY_API_KEY", "")
+CLOUDINARY_API_SECRET = os.environ.get("CLOUDINARY_API_SECRET", "")
+_cloudinary_configured = False
+
+def _init_cloudinary():
+    global _cloudinary_configured
+    if not _cloudinary_configured and CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET:
+        cloudinary.config(
+            cloud_name=CLOUDINARY_CLOUD_NAME,
+            api_key=CLOUDINARY_API_KEY,
+            api_secret=CLOUDINARY_API_SECRET,
+            secure=True,
+        )
+        _cloudinary_configured = True
+
+
+def upload_poster(image_url: str, public_id: str) -> str:
+    """Upload image to Cloudinary, returns Cloudinary URL or original on failure."""
+    if not image_url or not _cloudinary_configured:
+        return image_url
+    try:
+        r = requests.get(image_url, timeout=15, headers=HEADERS)
+        r.raise_for_status()
+        result = cloudinary.uploader.upload(
+            r.content,
+            public_id=public_id,
+            overwrite=True,
+        )
+        return result["secure_url"]
+    except Exception as e:
+        print(f"[CLOUDINARY] Upload failed {public_id}: {e}")
+        return image_url
+
 
 # ---------------------------------------------------------------------------
 # Compiled patterns
@@ -1530,6 +1567,16 @@ async def main():
         print("[INFO] All items are duplicates.")
         client.close()
         return
+
+    _init_cloudinary()
+    if _cloudinary_configured:
+        print(f"[CLOUDINARY] Uploading {len(final)} posters...")
+        for item in final:
+            poster = item.get("poster", "")
+            if poster and not poster.startswith("https://res.cloudinary.com/"):
+                item["poster"] = upload_poster(poster, f"poster/{item['id']}")
+    else:
+        print("[CLOUDINARY] Skipped (credentials not set)")
 
     result = collection.bulk_write(
         [UpdateOne({"id": item["id"]}, {"$set": item}, upsert=True) for item in final]
